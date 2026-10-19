@@ -80,7 +80,7 @@ static int s_bm_hf = 0, s_bm_vhf = 0, s_bm_uhf = 0; /* per-band preset cursor */
 static uint32_t s_rate_cur = 1152000; /* RTL2832 sample rate currently selected */
 
 /* Tuning step (Hz) applied by the [-]/[+] buttons; STEP button cycles it. */
-static const uint32_t STEPS[] = {100, 500, 1000, 5000, 6250, 12500, 25000, 100000, 1000000};
+static const uint32_t STEPS[] = {100, 500, 1000, 5000, 25000, 100000, 1000000};
 #define N_STEPS ((int)(sizeof(STEPS) / sizeof(STEPS[0])))
 static int s_step_i = 6; /* default 25 kHz */
 
@@ -379,7 +379,7 @@ static const box_t B_TDN  = {  6, 220, 56, 44};  /* tune down one step */
 static const box_t B_STEP = { 66, 220, 96, 44};  /* cycle step size    */
 static const box_t B_TUP  = {166, 220, 56, 44};  /* tune up one step   */
 static const box_t B_RS41 = {256, 220, 92, 44};  /* RS41 mode; pressed again in RS41 mode = centre on the strongest peak */
-static const box_t B_GAIN = {352, 220, 48, 44};  /* tuner gain: AGC / manual steps */
+static const box_t B_GAIN = {370, 220, 48, 44};  /* tuner gain: AGC / manual steps */
 static const box_t B_HF   = {  6, 272, 108, 44};
 static const box_t B_VHF  = {118, 272, 108, 44};
 static const box_t B_UHF  = {230, 272, 108, 44};
@@ -390,10 +390,10 @@ static const uint8_t MODE_ROW[] = {DSP_MODE_WFM, DSP_MODE_NFM, DSP_MODE_AM, DSP_
 #define MODE_BTN_X(i) (6 + (i) * (MODE_BTN_W + 3))
 #define MODE_BTN_Y 322
 #define MODE_BTN_H 36
-static const box_t B_VDN  = {404, 226, 46, 44};
-static const box_t B_VUP  = {540, 226, 46, 44};
-static const box_t B_SDN  = {404, 300, 46, 44};
-static const box_t B_SUP  = {540, 300, 46, 44};
+static const box_t B_VDN  = {456, 226, 46, 44};
+static const box_t B_VUP  = {592, 226, 46, 44};
+static const box_t B_SDN  = {456, 300, 46, 44};
+static const box_t B_SUP  = {592, 300, 46, 44};
 
 static void draw_box(const box_t *b, const char *label, int sc, uint16_t fill)
 {
@@ -427,17 +427,17 @@ static void draw_controls(void)
     draw_box(&B_UHF, "UHF", 2, COL_BTN);
 
     char v[8];
-    text(404, 212, 2, COL_TEXT, "VOL");
+    text(530, 212, 2, COL_TEXT, "VOL");
     draw_box(&B_VDN, "-", 3, COL_BTN);
     draw_box(&B_VUP, "+", 3, COL_BTN);
     snprintf(v, sizeof v, "%d", s_volume);
-    text(470, 238, 3, COL_LINE, v);
+    text(530, 238, 3, COL_LINE, v);
 
-    text(404, 286, 2, COL_TEXT, "SQL");
+    text(530, 286, 2, COL_TEXT, "SQL");
     draw_box(&B_SDN, "-", 3, COL_BTN);
     draw_box(&B_SUP, "+", 3, COL_BTN);
     snprintf(v, sizeof v, "%d", s_squelch);
-    text(466, 312, 3, COL_LINE, v);
+    text(520, 312, 3, COL_LINE, v);
 }
 
 /* ---- actions ------------------------------------------------------------- */
@@ -467,7 +467,7 @@ static void set_step_hz(uint32_t hz)
 }
 
 /* Standard FT8 dial frequencies (USB): 80, 40, 30, 20, 17, 15, 12, 10 m. */
-static const uint32_t FT8_FREQS[] = {3573000, 7074000, 10136000, 14074000, 18100000, 21074000, 24915000, 28074000};
+static const uint32_t FT8_FREQS[] = {1840000, 3573000, 5357000, 7074000, 10136000, 14074000, 18100000, 21074000, 24915000, 28074000, 50313000};
 #define N_FT8_FREQS (int)(sizeof(FT8_FREQS) / sizeof(FT8_FREQS[0]))
 static int s_ft8_i = 3; /* 20 m */
 
