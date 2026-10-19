@@ -1,12 +1,11 @@
 # Tab5-SDR
 
-A standalone **RTL-SDR receiver** that runs entirely on an **M5Stack Tab5**
+A standalone RTL-SDR receiver that runs entirely on an M5Stack Tab5
 (ESP32-P4) — no PC required. Plug an RTL-SDR dongle into the Tab5's USB-A host
 port and get a live spectrum + waterfall, touch tuning, and demodulated audio
-out the built-in speaker.
+out the built-in speaker
 
-- **Wideband FM** (broadcast) and **narrowband FM** (NOAA weather, conventional
-  public-safety voice) demodulation.
+- **Wideband FM** (broadcast) and **narrowband FM**.
 - **AM**, **USB**, **LSB** and **CW** (see "Modes" below).
 - **FT8** decoder (weak-signal amateur digital mode, 14.074 MHz etc.): list of decoded messages with frequency, SNR and DT.
 - **RS41 radiosonde** decoder (Vaisala weather balloons, 400–406 MHz): serial, frame no., GPS position/altitude/speed/time.
@@ -17,13 +16,7 @@ out the built-in speaker.
 ## Hardware
 
 - **M5Stack Tab5** (ESP32-P4 + ESP32-C6), 720×1280 MIPI-DSI panel.
-- An **RTL-SDR** dongle (RTL2832U + R820T/R828D) on the **USB-A** port — a short
-  USB-A extension cable is recommended (clears the USB-C port and reduces noise).
-- The Tab5's **internal battery must be connected** — it browns out on USB power
-  alone, especially under the dongle's ~300 mA load.
-
-> The USB-A port's 5 V VBUS is **off by default**; the firmware enables it at boot
-> (`bsp_tab5_set_usb_host_power`).
+- An **RTL-SDR** dongle V4 recommended,(RTL2832U + R820T/R828D) on the **USB-A**   port, external power suppl for tab5 is recommended but working fine on usb   power.
 
 ## Build & flash
 
@@ -105,20 +98,6 @@ panel then shows serial/frame number but `POSITION ENCRYPTED`. Temperature /
 humidity / pressure are not decoded (they need the per-sonde calibration that
 is spread over many frames).
 
-## Architecture
-
-The same P4 runs four cooperating pieces:
-
-```
-RTL-SDR ──USB-A host──► librtlsdr ──► IQ ring (PSRAM)
-                          (libusb shim over esp-idf usb_host)
-                                         │
-   [core 1] iq_proc: FM demod ──► audio ring ──► [core 1] ES8388 / I2S speaker
-            + FFT snapshot ──► spectrum buffer
-                                         │
-   [core 0] ui: spectrum + waterfall + controls → 640×360 buffer
-            ──► PPA (scale ×2, rotate 90°) ──► 720×1280 panel
-```
 
 | Module | Role |
 |--------|------|
@@ -148,6 +127,7 @@ This project is licensed under the **GNU General Public License v2.0 or later**
   [Tab5-HID-Device](https://github.com/hardparking/Tab5-HID-Device) by
   Hiroki Kawakami (MIT).
 - **esp-dsp**, **esp_codec_dev**, and the LCD/touch drivers — Espressif (Apache-2.0).
+- ft8.h — FT8 decoder glue (protocol code: ft8lib/, MIT, by K. Goba).
 
 Modifications to the vendored librtlsdr sources are documented inline (e.g. the
 `usb_host` shim and a missing `<string.h>` include for GCC 14).
