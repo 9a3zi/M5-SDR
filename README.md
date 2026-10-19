@@ -127,7 +127,6 @@ This project is licensed under the **GNU General Public License v2.0 or later**
   [Tab5-HID-Device](https://github.com/hardparking/Tab5-HID-Device) by
   Hiroki Kawakami (MIT).
 - **esp-dsp**, **esp_codec_dev**, and the LCD/touch drivers — Espressif (Apache-2.0).
-- ft8.h — FT8 decoder glue (protocol code: ft8lib/, MIT, by K. Goba).
 
 Modifications to the vendored librtlsdr sources are documented inline (e.g. the
 `usb_host` shim and a missing `<string.h>` include for GCC 14).
