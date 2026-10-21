@@ -43,6 +43,8 @@ into `managed_components/` (pinned by `dependencies.lock`).
 
 ## Using it
 
+-*******  BEFORE FLASH edit wifi info and station data to file net_cfg.h !!!!  *******
+
 - **Tune:** drag the spectrum/waterfall to scan (~100 MHz per swipe); `[-]`/`[+]`
   step by the selected **STEP** (1 k … 1 M, tap STEP to cycle); or tap a band button.
 - **Mode:** bottom-left row `WFM NFM AM USB LSB CW`. Broadcast FM = WFM; NOAA and
