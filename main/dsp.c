@@ -11,7 +11,11 @@
  *                            → /6 boxcar → 48 kHz → 75 µs de-emphasis → int16.
  *
  * Baseband modes (AM / USB / LSB / CW) share one front end:
- *   /4 boxcar → 288 kHz → /6 triangular (CIC-2) → 48 kHz complex baseband.
+ *   1.152 MS/s: /4 boxcar → 288 kHz → /6 triangular (CIC-2) → 48 kHz complex.
+ *   288 kS/s:   /2 boxcar → 144 kHz → /3 triangular (CIC-2) → 48 kHz complex —
+ *               the /2 stage is essential: without it there is no anti-alias
+ *               filter before the /3 stage and everything from 48 kHz to
+ *               240 kHz offset folds into the audio.
  *   AM     : 5 kHz IIR low-pass on I/Q → envelope → carrier-referenced AGC.
  *   USB/LSB: DC block → Weaver: mix by ∓1.5 kHz → 255-tap FIR low-pass on I/Q
  *            → mix back, take real part (opposite sideband is rejected) → AGC.
@@ -34,6 +38,7 @@
 #include "audio.h"
 #include "rs41.h"
 #include "ft8.h"
+#include "wspr.h"
 
 static const char *TAG = "dsp";
 
@@ -66,6 +71,19 @@ static float s_gain = 9000.0f;
 #define CW_PITCH_HZ  700.0f
 #define CW_CUT_HZ    300.0f
 #define AM_CUT_HZ    5000.0f
+
+/* FM audio output filtering (post-discriminator, 48 kHz). WFM: a 15 kHz
+ * low-pass removes the 19 kHz stereo pilot, the RDS subcarrier (57 kHz folds
+ * to ~9 kHz through the /6 phase decimation) and the L-R subcarrier folded
+ * into 10..25 kHz — without it broadcast FM sounds hissy/buzzy. NFM: 3.4 kHz
+ * voice band-limit removes a large share of the discriminator noise. */
+#define WFM_AUDIO_CUT_HZ 15000.0f
+#define NFM_AUDIO_CUT_HZ 3400.0f
+
+/* NFM de-emphasis: 300 µs one-pole (a = dt/(dt+RC) at 48 kHz ≈ 0.065).
+ * Most FM voice links pre-emphasise; without the matching de-emphasis speech
+ * sounds thin and hissy. Set to ~0.065f to enable, 0.0f for flat audio. */
+#define NFM_DEEMPH_A 0.0f /* 0.065f = 300 µs de-emphasis on */
 
 #define SSB_FIR_N 255 /* odd → linear phase, symmetric */
 
@@ -151,8 +169,11 @@ static volatile float s_squelch_db = -200.0f; /* disabled by default */
 static uint32_t s_rate = RATE_HI;        /* owned by the DSP task */
 static volatile uint32_t s_req_rate;     /* 0 = no request */
 static volatile uint32_t s_span = RATE_HI;
-static int s_bb_d1 = 4;                  /* baseband stage-1 boxcar: rate / 288 kHz */
+static int s_bb_d1 = 4;                  /* baseband stage-1 boxcar: 4 @ 1.152 MS/s, 2 @ 288 kS/s */
 static float s_bb_inv1 = 0.25f;
+static int s_bb_d2 = 6;                  /* stage-2 triangular decimation → 48 kHz */
+static const float *s_bb_triC = TRI_C;   /* stage-2 polyphase weights (TRI_* /6 or W3* /3) */
+static const float *s_bb_triN = TRI_N;
 
 /* 288k -> 96k triangular (CIC-2) tap for the FFT */
 static const float W3C[3] = {3 / 9.0f, 2 / 9.0f, 1 / 9.0f};
@@ -167,6 +188,8 @@ static int s_lo_n;
 static int s_mode;                 /* owned by the DSP task */
 static volatile int s_mode_pub;    /* what dsp_get_mode() reports */
 static volatile int s_req_mode = -1;
+
+static inline float af_run(float x); /* FM audio low-pass, defined with the filter design below */
 
 static void demod_fm(void)
 {
@@ -207,6 +230,7 @@ static void demod_fm(void)
         float out;
         if (dea > 0) { d_deemph += dea * (a - d_deemph); out = d_deemph; }
         else out = a;
+        out = af_run(out); /* audio low-pass: WFM 15 kHz (pilot/RDS/stereo), NFM 3.4 kHz (hiss) */
         int v = open ? (int)(out * gain) : 0;
         if (v > 32767) v = 32767;
         if (v < -32768) v = -32768;
@@ -339,10 +363,11 @@ float dsp_signal_db(void) { return s_sig_db; }
 
 /* ---- filter design -------------------------------------------------------- */
 
-/* Butterworth low-pass as `nsec` cascaded RBJ biquads (order 2*nsec). */
-static void design_butter_lp(int nsec, float fc, float fs)
+/* Butterworth low-pass as `nsec` cascaded RBJ biquads (order 2*nsec), written
+ * into a caller-supplied array so independent filters don't share state. */
+static void design_butter_lp_to(biquad_t *bq, int *pn, int nsec, float fc, float fs)
 {
-    s_bq_n = nsec;
+    *pn = nsec;
     float w0 = 2.0f * (float)M_PI * fc / fs;
     float cw = cosf(w0), sw = sinf(w0);
     for (int k = 0; k < nsec; k++) {
@@ -350,7 +375,7 @@ static void design_butter_lp(int nsec, float fc, float fs)
         float q = 1.0f / (2.0f * cosf(th));
         float alpha = sw / (2.0f * q);
         float a0 = 1.0f + alpha;
-        biquad_t *b = &s_bq[k];
+        biquad_t *b = &bq[k];
         b->b0 = (1.0f - cw) * 0.5f / a0;
         b->b1 = (1.0f - cw) / a0;
         b->b2 = b->b0;
@@ -359,6 +384,33 @@ static void design_butter_lp(int nsec, float fc, float fs)
         memset(b->z1, 0, sizeof b->z1);
         memset(b->z2, 0, sizeof b->z2);
     }
+}
+
+static void design_butter_lp(int nsec, float fc, float fs)
+{
+    design_butter_lp_to(s_bq, &s_bq_n, nsec, fc, fs);
+}
+
+/* FM audio low-pass (post-discriminator, 48 kHz). Independent of s_bq so it
+ * survives mode switches of the baseband modes. WFM: kills the 19 kHz pilot,
+ * the RDS subcarrier (57 kHz aliases to ~9 kHz!) and the L-R subcarrier that
+ * the /6 phase boxcar folds into 10..25 kHz. NFM: voice band-limit → less hiss. */
+static biquad_t s_af[4];
+static int s_af_n;
+static inline float bq_run_buf(biquad_t *b, float x); /* defined below */
+
+static inline float af_run(float x)
+{
+    for (int k = 0; k < s_af_n; k++) x = bq_run_buf(&s_af[k], x);
+    return x;
+}
+
+static inline float bq_run_buf(biquad_t *b, float x)
+{
+    float y = b->b0 * x + b->z1[0];
+    b->z1[0] = b->b1 * x - b->a1 * y + b->z2[0];
+    b->z2[0] = b->b2 * x - b->a2 * y;
+    return y;
 }
 
 static inline float bq_run(int ch, float x)
@@ -445,7 +497,7 @@ static void demod_bb(void)
         float I = (float)s_blk[2 * i] - 127.4f;
         float Q = (float)s_blk[2 * i + 1] - 127.4f;
 
-        /* stage 1: boxcar → 288 kHz (/4 at 1.152 MS/s, pass-through at 288 kS/s) */
+        /* stage 1: boxcar → 288 kHz (/4 at 1.152 MS/s) or → 144 kHz (/2 at 288 kS/s) */
         b_accI += I;
         b_accQ += Q;
         if (++b_cnt4 < d1) continue;
@@ -453,13 +505,13 @@ static void demod_bb(void)
         b_accI = b_accQ = 0;
         b_cnt4 = 0;
 
-        /* stage 2: /6 triangular (CIC-2) → 48 kHz */
+        /* stage 2: triangular (CIC-2) → 48 kHz (÷6 @ 1.152 MS/s, ÷3 @ 288 kS/s) */
         int p = b_p6;
-        b_cI += fi * TRI_C[p];
-        b_nI += fi * TRI_N[p];
-        b_cQ += fq * TRI_C[p];
-        b_nQ += fq * TRI_N[p];
-        if (++b_p6 < 6) continue;
+        b_cI += fi * s_bb_triC[p];
+        b_nI += fi * s_bb_triN[p];
+        b_cQ += fq * s_bb_triC[p];
+        b_nQ += fq * s_bb_triN[p];
+        if (++b_p6 < s_bb_d2) continue;
         b_p6 = 0;
         float zI = b_cI, zQ = b_cQ;
         b_cI = b_nI; b_nI = 0;
@@ -514,7 +566,8 @@ static void demod_bb(void)
             /* … and shift back up, real part = audio. */
             float y = a * c - sgn * b * sn;
 
-            if (mode == DSP_MODE_FT8) ft8_feed(y); /* decoder gets the audio before the AGC */
+            if (mode == DSP_MODE_FT8) ft8_feed(y); /* decoders get the audio before the AGC */
+            else if (mode == DSP_MODE_WSPR) wspr_feed(y);
 
             /* feed-forward peak AGC */
             float ay = fabsf(y);
@@ -550,8 +603,17 @@ static void demod_bb(void)
 
 static void apply_mode(int m)
 {
-    s_bb_d1 = (int)(s_rate / 288000u);
-    if (s_bb_d1 < 1) s_bb_d1 = 1;
+    /* Baseband decimation to 48 kHz, always as boxcar → triangular (CIC-2).
+     * At 288 kS/s the /2 boxcar is essential anti-alias for the /3 stage:
+     * without it everything from 48 kHz to 240 kHz offset aliases into the
+     * audio (FT8/WSPR live at 288 kS/s — this was the "dirty HF audio"). */
+    if (s_rate == RATE_HI) {
+        s_bb_d1 = 4; s_bb_d2 = 6;
+        s_bb_triC = TRI_C; s_bb_triN = TRI_N;
+    } else {
+        s_bb_d1 = 2; s_bb_d2 = 3;
+        s_bb_triC = W3C; s_bb_triN = W3N;
+    }
     s_bb_inv1 = 1.0f / s_bb_d1;
     /* reset every demod/filter state to avoid a transient */
     d_accI = d_accQ = d_accAud = 0;
@@ -567,7 +629,8 @@ static void apply_mode(int m)
     switch (m) {
     case DSP_MODE_NFM:
         s_decim_if = (int)(s_rate / 48000u); s_decim_audio = 1; /* 48 kHz IF */
-        s_deemph_a = 0.0f; s_gain = 18000.0f;
+        s_deemph_a = NFM_DEEMPH_A; s_gain = 18000.0f;
+        design_butter_lp_to(s_af, &s_af_n, 2, NFM_AUDIO_CUT_HZ, BB_RATE);
         break;
     case DSP_MODE_AM:
         design_butter_lp(2, AM_CUT_HZ, BB_RATE);
@@ -580,17 +643,20 @@ static void apply_mode(int m)
         break;
     case DSP_MODE_USB:
     case DSP_MODE_LSB:
-    case DSP_MODE_FT8: {
-        float sg = (m == DSP_MODE_LSB) ? -1.0f : 1.0f; /* FT8 is USB */
+    case DSP_MODE_FT8:
+    case DSP_MODE_WSPR: {
+        float sg = (m == DSP_MODE_LSB) ? -1.0f : 1.0f; /* FT8 and WSPR are USB */
         if (DSP_SSB_SWAP) sg = -sg;
-        float pitch = (m == DSP_MODE_FT8) ? FT8_PITCH_HZ : SSB_PITCH_HZ;
-        float cut = (m == DSP_MODE_FT8) ? FT8_CUT_HZ : SSB_CUT_HZ;
+        bool dig = (m == DSP_MODE_FT8 || m == DSP_MODE_WSPR); /* wide passband for the digital modes */
+        float pitch = dig ? FT8_PITCH_HZ : SSB_PITCH_HZ;
+        float cut = dig ? FT8_CUT_HZ : SSB_CUT_HZ;
         s_bb_sgn = sg;
         s_bb_w0 = 2.0f * (float)M_PI * pitch / BB_RATE;
         s_osc_wc = cosf(s_bb_w0); s_osc_ws = sinf(s_bb_w0);
         design_fir_lp(cut, BB_RATE);
         s_agc_dec = SSB_AGC_DECAY;
         if (m == DSP_MODE_FT8) ft8_reset();
+        if (m == DSP_MODE_WSPR) wspr_reset();
         break;
     }
     case DSP_MODE_CW:
@@ -605,6 +671,7 @@ static void apply_mode(int m)
         m = DSP_MODE_WFM;
         s_decim_if = (int)(s_rate / 288000u); s_decim_audio = 6; /* 288 kHz IF → 48 kHz audio */
         s_deemph_a = 0.24f; s_gain = 9000.0f;
+        design_butter_lp_to(s_af, &s_af_n, 2, WFM_AUDIO_CUT_HZ, BB_RATE);
         break;
     }
     if (m <= DSP_MODE_NFM) {
@@ -685,6 +752,6 @@ int dsp_get_mode(void) { return s_mode_pub; }
 
 const char *dsp_mode_name(int mode)
 {
-    static const char *const N[DSP_MODE_COUNT] = {"WFM", "NFM", "AM", "USB", "LSB", "CW", "RS41", "FT8"};
+    static const char *const N[DSP_MODE_COUNT] = {"WFM", "NFM", "AM", "USB", "LSB", "CW", "RS41", "FT8", "WSPR"};
     return (mode >= 0 && mode < DSP_MODE_COUNT) ? N[mode] : "?";
 }

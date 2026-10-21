@@ -1,22 +1,32 @@
 # Tab5-SDR
 
-A standalone RTL-SDR receiver that runs entirely on an M5Stack Tab5
+A standalone **RTL-SDR receiver** that runs entirely on an **M5Stack Tab5**
 (ESP32-P4) — no PC required. Plug an RTL-SDR dongle into the Tab5's USB-A host
 port and get a live spectrum + waterfall, touch tuning, and demodulated audio
-out the built-in speaker
+out the built-in speaker.
 
-- **Wideband FM** (broadcast) and **narrowband FM**.
+- **Wideband FM** (broadcast) and **narrowband FM** (NOAA weather, conventional
+  public-safety voice) demodulation.
 - **AM**, **USB**, **LSB** and **CW** (see "Modes" below).
 - **FT8** decoder (weak-signal amateur digital mode, 14.074 MHz etc.): list of decoded messages with frequency, SNR and DT.
+- **WSPR** decoder (2-minute beacon mode, 14.0956 MHz etc.): list of decoded spots with callsign, locator and power.
+- WSPR and FT8 can upload data to pskreporter
 - **RS41 radiosonde** decoder (Vaisala weather balloons, 400–406 MHz): serial, frame no., GPS position/altitude/speed/time.
 - On-device **FFT spectrum + scrolling waterfall** (esp-dsp), landscape, ~20 fps.
 - **Touch UI**: drag the waterfall to scan, fine-step tuning, volume, squelch,
   and one-tap **band buttons** (HF 14 MHz USB, VHF 144 MHz NFM, UHF 430 MHz NFM).
+- AGC, Squelch, Volume...etc... controll
 
 ## Hardware
 
 - **M5Stack Tab5** (ESP32-P4 + ESP32-C6), 720×1280 MIPI-DSI panel.
-- An **RTL-SDR** dongle V4 recommended,(RTL2832U + R820T/R828D) on the **USB-A**   port, external power suppl for tab5 is recommended but working fine on usb   power.
+- An **RTL-SDR** dongle (RTL2832U + R820T/R828D) on the **USB-A** port — a short
+  USB-A extension cable is recommended (clears the USB-C port and reduces noise).
+- The Tab5's **internal battery must be connected** — it browns out on USB power
+  alone, especially under the dongle's ~300 mA load.
+
+> The USB-A port's 5 V VBUS is **off by default**; the firmware enables it at boot
+> (`bsp_tab5_set_usb_host_power`).
 
 ## Build & flash
 
@@ -76,18 +86,52 @@ first decode it keeps the timing by counting audio samples. If nothing decodes f
 6 slots it scans again. Expect a decode only after the first full transmission
 heard, i.e. up to ~15-30 s after tuning in.
 
-Columns: audio frequency (Hz), approximate SNR (dB in 2500 Hz), DT (seconds vs.
-the slot grid *as set by the first decode*, so it is relative to the stations you
-hear, not to UTC), message. Newest slot is bright, CQ calls yellow.
+The panel shows the last 24 messages, newest first, in three columns of eight:
+audio frequency (Hz), approximate SNR (dB in 2500 Hz) and the message (long free
+text is cut to fit). The newest slot is bright, older ones grey, CQ calls yellow.
 
 Protocol code (LDPC, CRC, message packing) is `ft8_lib` by Karlis Goba (MIT),
 in `main/ft8lib/`; see `main/ft8lib/README_THIRD_PARTY.md`.
+
+### WSPR
+
+Press **WSPR** (right end of the mode row): 96 kHz HF view, USB, dial 14.0956 MHz
+(20 m) unless you are already on a WSPR dial frequency; press again to step through
+160/80/60/40/30/20/17/15/12/10/6 m (1.8366 ... 28.1246, 50.2930 MHz). WSPR signals
+sit at 1400-1600 Hz audio (the analysed band is 1300-1700 Hz).
+
+A transmission lasts 111 s, so a spot appears when it ends (up to 2 minutes after
+tuning in). There is no clock on the device, so the decoder does not wait for the
+2-minute slot grid: it keeps a rolling 2-minute spectrogram, searches it for the
+sync pattern at every time offset and decodes each signal as soon as it is complete.
+Columns: audio frequency (Hz), approximate SNR (dB in 2500 Hz), callsign, locator,
+power (dBm). `OTHER n` counts decoded messages of the rarer extended types 2/3,
+which are not displayed.
+
+**If nothing decodes:** the WSPR panel header shows where the chain stops.
+`BUF n S OF 115` is how much audio has been collected (a decode is only possible after
+about 115 s plus one complete transmission, so wait ~4 minutes and do not retune
+meanwhile: the signal must stay at the same audio frequency for 2 minutes);
+`SC` = sync scans done, `CAND` = candidates tried, `FANO` = decodes that converged,
+`BEST` = strongest sync correlation of the last scan (candidates need > 0.15; if it
+stays near 0.05-0.10 there is simply no usable WSPR signal in 1300-1700 Hz audio),
+`DROP` = audio samples lost because the decoder could not keep up.
+**Tap the WSPR panel** to run a self-test: the decoder synthesises two -20 dB WSPR
+transmissions and runs them through the real pipeline faster than real time
+(about a minute). `TEST OK 5X` means the decoder works on this hardware and
+processes 5 s of audio per second; then any remaining problem is the radio side
+(antenna, propagation, tuning).
+
+Independent implementation from the public protocol description (no code from
+WSJT-X, which is GPLv3). Measured on synthetic signals: decodes down to about
+-28 dB, tolerates drift up to +-2.5 Hz over the message, no false decodes in 25 min
+of noise.
 
 ### RS41 radiosondes
 
 Select `RS41` (jumps to 403.000 MHz if you are not in 400–406 MHz). Find the
 sonde on the spectrum (a ~10 kHz wide hump; radiosondy.info / sondehub.org list
-active frequencies), press **SNAP** to centre on the peak, and the waterfall
+active frequencies), press the **RS41** button again to centre on the peak (it snaps to the strongest signal in the view), and the waterfall
 area turns into a telemetry panel. Decoding: header sync (both polarities) →
 de-whitening → Reed-Solomon RS(255,231) ×2 → CRC16 per block. The bit clock is tracked during the frame (±0.8 % baud error). Blocks are parsed in
 sequence by type (position `0x7B`, or `0x82`/`0x83` on newer sondes). If the
@@ -98,6 +142,20 @@ panel then shows serial/frame number but `POSITION ENCRYPTED`. Temperature /
 humidity / pressure are not decoded (they need the per-sonde calibration that
 is spread over many frames).
 
+## Architecture
+
+The same P4 runs four cooperating pieces:
+
+```
+RTL-SDR ──USB-A host──► librtlsdr ──► IQ ring (PSRAM)
+                          (libusb shim over esp-idf usb_host)
+                                         │
+   [core 1] iq_proc: FM demod ──► audio ring ──► [core 1] ES8388 / I2S speaker
+            + FFT snapshot ──► spectrum buffer
+                                         │
+   [core 0] ui: spectrum + waterfall + controls → 640×360 buffer
+            ──► PPA (scale ×2, rotate 90°) ──► 720×1280 panel
+```
 
 | Module | Role |
 |--------|------|
@@ -105,6 +163,7 @@ is spread over many frames).
 | `main/dsp.c`   | WFM/NFM demod → audio; windowed FFT → spectrum; squelch |
 | `main/audio.c` | ES8388 speaker output (esp_codec_dev) via a StreamBuffer |
 | `main/ui.c`    | landscape touch UI; PPA-rotated rendering |
+| `main/wspr.c`, `main/ft8.c` | WSPR and FT8 decoders (FT8 protocol code in `main/ft8lib/`) |
 | `main/bookmarks.h` | HF / VHF / UHF band presets (mode, sample rate, step) |
 | `components/bsp/` | M5Stack Tab5 board support (panel, touch, I/O, audio, USB power) |
 | `components/librtlsdr/` | librtlsdr ported onto the ESP-IDF USB host stack |

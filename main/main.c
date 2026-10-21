@@ -20,8 +20,11 @@
 #include "sdr.h"
 #include "dsp.h"
 #include "ft8.h"
+#include "wspr.h"
 #include "audio.h"
 #include "ui.h"
+#include "wifi_net.h"
+#include "psk.h"
 
 static const char *TAG = "tab5-sdr";
 
@@ -104,7 +107,13 @@ void app_main(void)
     audio_init();
     dsp_start();
     ft8_start(); /* FT8 decoder task (idle until FT8 mode feeds it audio) */
+    wspr_start(); /* WSPR decoder task (likewise) */
     ui_start();
+
+    /* WiFi (P4 ← C6 via esp_hosted) + SNTP, then the PSK Reporter uploader.
+     * Non-fatal without a network: the receiver works offline. */
+    wifi_net_init();
+    psk_init();
 
     /* Heartbeat: confirm the stream stays drop-free under the DSP load. */
     while (1) {

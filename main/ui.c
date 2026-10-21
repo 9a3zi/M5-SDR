@@ -26,8 +26,10 @@
 #include "dsp.h"
 #include "rs41.h"
 #include "ft8.h"
+#include "wspr.h"
 #include "audio.h"
 #include "bookmarks.h"
+#include "psk.h"
 
 static const char *TAG = "ui";
 
@@ -208,6 +210,7 @@ static uint16_t mode_color(int m)
     case DSP_MODE_CW:  return RGB565(200, 160, 255);
     case DSP_MODE_RS41: return RGB565(255, 90, 90);
     case DSP_MODE_FT8:  return RGB565(60, 220, 200);
+    case DSP_MODE_WSPR: return RGB565(240, 170, 80);
     default:           return COL_ACCENT; /* WFM */
     }
 }
@@ -262,6 +265,9 @@ static uint16_t heat(float t)
     return RGB565(r, g, b);
 }
 
+static int s_panel_mode = -1;      /* which text panel's body is currently drawn (-1 = none/stale) */
+static uint32_t s_panel_total = 0; /* message count that body was drawn for */
+
 /* RS41 mode: the waterfall area becomes a telemetry panel. */
 static void draw_rs41_panel(void)
 {
@@ -269,6 +275,7 @@ static void draw_rs41_panel(void)
     static TickType_t last_tick;
     rs41_info_t in;
     bool have = rs41_get_info(&in);
+    s_panel_mode = -1; /* this panel overwrites the shared area */
     rect(0, WF_Y0, LW, WF_H, RGB565(0, 0, 0));
 
     const int x = 8, pitch = 18;
@@ -306,54 +313,123 @@ static void draw_rs41_panel(void)
     text(x, y, 2, RGB565(150, 150, 150), b);
 }
 
-/* FT8 mode: the waterfall area shows the decoded messages, newest first, in three
- * columns of eight lines (24 messages = everything the decoder keeps). Each line:
- * audio frequency, SNR, text (the text is cut to fit the column). */
-#define FT8_COLS     3
-#define FT8_ROWS     8
-#define FT8_COL_W    (LW / FT8_COLS) /* 213 px = 35 characters at scale 1 */
-#define FT8_TEXT_CH  26              /* characters left for the text after "1523 -12 " */
+/* FT8 / WSPR: the waterfall area shows the decoded messages, newest first, in three
+ * columns of eight lines (24 messages = everything the decoders keep). Each line:
+ * audio frequency, SNR, text (cut to fit the column). The header strip is redrawn
+ * every frame (it has a running timer); the message body only when the message
+ * count changes, so an idle panel costs almost nothing. */
+#define PANEL_COLS    3
+#define PANEL_ROWS    8
+#define PANEL_COL_W   (LW / PANEL_COLS) /* 213 px = 35 characters at scale 1 */
+#define PANEL_TEXT_CH 26                /* characters left for the text after "1523 -12 " */
+#define PANEL_HDR_H   11
+
+static inline bool is_panel_mode(int m) { return m == DSP_MODE_RS41 || m == DSP_MODE_FT8 || m == DSP_MODE_WSPR; }
+
+/* Prepare the panel: clears what is needed. Returns true if the body must be (re)drawn. */
+static bool panel_begin(int mode, uint32_t total)
+{
+    bool body = (s_panel_mode != mode) || (s_panel_total != total);
+    rect(0, WF_Y0, LW, body ? WF_H : PANEL_HDR_H + 2, RGB565(0, 0, 0));
+    if (body) { s_panel_mode = mode; s_panel_total = total; }
+    return body;
+}
+
+static void panel_line(int k, int total_lines, uint16_t color, const char *text_line)
+{
+    (void)total_lines;
+    int col = k / PANEL_ROWS, row = k % PANEL_ROWS;
+    text(col * PANEL_COL_W + 4, WF_Y0 + 3 + PANEL_HDR_H + row * 10, 1, color, text_line);
+}
+
+static void panel_separators(void)
+{
+    for (int c = 1; c < PANEL_COLS; c++)
+        rect(c * PANEL_COL_W - 3, WF_Y0 + 3 + PANEL_HDR_H - 1, 1, PANEL_ROWS * 10, RGB565(45, 45, 70));
+}
 
 static void draw_ft8_panel(void)
 {
-    ft8_msg_t msgs[FT8_COLS * FT8_ROWS];
+    ft8_msg_t msgs[PANEL_COLS * PANEL_ROWS];
     ft8_status_t st;
-    int n = ft8_get_messages(msgs, FT8_COLS * FT8_ROWS, &st); /* oldest first */
-    rect(0, WF_Y0, LW, WF_H, RGB565(0, 0, 0));
+    int n = ft8_get_messages(msgs, PANEL_COLS * PANEL_ROWS, &st); /* oldest first */
+    bool body = panel_begin(DSP_MODE_FT8, st.total);
 
     char b[100];
-    int y0 = WF_Y0 + 3;
     if (st.locked)
         snprintf(b, sizeof b, "FT8  SLOT SYNC OK   T %04.1f S   SLOTS %u   MSGS %u", (double)st.slot_pos,
                  (unsigned)st.slots, (unsigned)st.total);
     else
         snprintf(b, sizeof b, "FT8  SCANNING FOR THE SLOT TIMING   MSGS %u", (unsigned)st.total);
-    text(6, y0, 1, st.locked ? RGB565(60, 220, 140) : RGB565(255, 190, 60), b);
-    y0 += 11;
+    text(6, WF_Y0 + 3, 1, st.locked ? RGB565(60, 220, 140) : RGB565(255, 190, 60), b);
+    if (!body) return;
 
     if (n == 0) {
-        text(6, y0, 1, RGB565(170, 170, 170), "NO MESSAGES YET. TUNE TO AN FT8 FREQUENCY IN USB,");
-        text(6, y0 + 10, 1, RGB565(170, 170, 170), "E.G. 14.074 MHZ (20 M). THE FIRST DECODE SETS THE SLOT TIMING.");
+        text(6, WF_Y0 + 3 + PANEL_HDR_H, 1, RGB565(170, 170, 170), "NO MESSAGES YET. TUNE TO AN FT8 FREQUENCY IN USB,");
+        text(6, WF_Y0 + 3 + PANEL_HDR_H + 10, 1, RGB565(170, 170, 170), "E.G. 14.074 MHZ (20 M). THE FIRST DECODE SETS THE SLOT TIMING.");
         return;
     }
-
-    for (int c = 1; c < FT8_COLS; c++) /* faint column separators */
-        rect(c * FT8_COL_W - 3, y0 - 1, 1, FT8_ROWS * 10, RGB565(45, 45, 70));
-
+    panel_separators();
     uint16_t newest_slot = msgs[n - 1].slot;
-    for (int k = 0; k < n && k < FT8_COLS * FT8_ROWS; k++) {
+    for (int k = 0; k < n; k++) {
         const ft8_msg_t *m = &msgs[n - 1 - k]; /* k = 0 is the newest */
-        int col = k / FT8_ROWS, row = k % FT8_ROWS;
-        snprintf(b, sizeof b, "%4d %+3d %.*s", (int)m->freq, (int)m->snr, FT8_TEXT_CH, m->text);
+        snprintf(b, sizeof b, "%4d %+3d %.*s", (int)m->freq, (int)m->snr, PANEL_TEXT_CH, m->text);
         uint16_t color = (m->slot == newest_slot) ? RGB565(235, 235, 235) : RGB565(120, 120, 120);
         if (m->slot == newest_slot && m->text[0] == 'C' && m->text[1] == 'Q') color = RGB565(255, 220, 0); /* CQ calls */
-        text(col * FT8_COL_W + 4, y0 + row * 10, 1, color, b);
+        panel_line(k, n, color, b);
+    }
+}
+
+static void draw_wspr_panel(void)
+{
+    wspr_msg_t msgs[PANEL_COLS * PANEL_ROWS];
+    wspr_status_t st;
+    int n = wspr_get_messages(msgs, PANEL_COLS * PANEL_ROWS, &st); /* oldest first */
+    bool body = panel_begin(DSP_MODE_WSPR, st.total + st.other_types + 1000u * (uint32_t)st.selftest_state);
+
+    char b[160];
+    if (st.selftest_state == 1) {
+        snprintf(b, sizeof b, "WSPR SELF TEST RUNNING %d %%  (SYNTHETIC SIGNAL THROUGH THE REAL DECODER)", st.selftest_pct);
+    } else {
+        if (st.grid_known)
+            snprintf(b, sizeof b, "WSPR  T %03.0f S  SPOTS %u  BUF %.0f S", (double)st.cycle_pos, (unsigned)st.total,
+                     (double)st.buffered_s);
+        else
+            snprintf(b, sizeof b, "WSPR  LISTENING  BUF %.0f S OF 115  SPOTS %u", (double)st.buffered_s, (unsigned)st.total);
+        size_t l = strlen(b);
+        if (st.other_types) { snprintf(b + l, sizeof b - l, "  OTHER %u", (unsigned)st.other_types); l = strlen(b); }
+        /* where does the chain stop?  SC = sync scans, CAND = candidates tried, FANO = decodes
+         * that converged, BEST = strongest sync correlation of the last scan (0.15 = threshold),
+         * DROP = audio samples lost */
+        snprintf(b + l, sizeof b - l, "   SC %u CAND %u FANO %u BEST %.2f DROP %u", (unsigned)st.scans, (unsigned)st.cands,
+                 (unsigned)st.fano_ok, (double)st.best_m, (unsigned)st.drops);
+        l = strlen(b);
+        if (st.selftest_state == 2) snprintf(b + l, sizeof b - l, "   TEST OK %.0fX", (double)st.selftest_speed);
+        else if (st.selftest_state == 3) snprintf(b + l, sizeof b - l, "   TEST FAILED");
+    }
+    uint16_t hc = st.selftest_state == 3 ? RGB565(255, 90, 90) : (st.grid_known ? RGB565(240, 170, 80) : RGB565(255, 190, 60));
+    text(6, WF_Y0 + 3, 1, hc, b);
+    if (!body) return;
+
+    if (n == 0) {
+        int y = WF_Y0 + 3 + PANEL_HDR_H;
+        text(6, y, 1, RGB565(170, 170, 170), "NO SPOTS YET. TUNE TO A WSPR DIAL FREQUENCY IN USB, E.G. 14.0956 MHZ (20 M).");
+        text(6, y + 10, 1, RGB565(170, 170, 170), "A SPOT APPEARS WHEN A TRANSMISSION ENDS; THE FIRST ONE NEEDS ABOUT 4 MIN. DO NOT RETUNE");
+        text(6, y + 20, 1, RGB565(170, 170, 170), "WHILE WAITING: THE SIGNAL MUST STAY AT THE SAME AUDIO FREQUENCY FOR 2 MINUTES.");
+        text(6, y + 40, 1, RGB565(120, 200, 255), "TAP THIS PANEL TO RUN A SELF TEST (SYNTHETIC SIGNAL, ABOUT 1 MIN, CHECKS THE DECODER ITSELF).");
+        return;
+    }
+    panel_separators();
+    for (int k = 0; k < n; k++) {
+        const wspr_msg_t *m = &msgs[n - 1 - k];
+        snprintf(b, sizeof b, "%4d %+3d %.*s", (int)lroundf(m->freq), (int)m->snr, PANEL_TEXT_CH, m->text);
+        panel_line(k, n, k < PANEL_ROWS ? RGB565(235, 235, 235) : RGB565(120, 120, 120), b);
     }
 }
 
 static void draw_spectrum(const float *spec, int bins)
 {
-    const bool rs = (s_mode == DSP_MODE_RS41 || s_mode == DSP_MODE_FT8); /* mode with a text panel */
+    const bool rs = is_panel_mode(s_mode); /* mode with a text panel instead of the waterfall */
     if (!rs)
         memmove(LBUF + (size_t)(WF_Y0 + 1) * LW, LBUF + (size_t)WF_Y0 * LW,
                 (size_t)(WF_H - 1) * LW * sizeof(uint16_t));
@@ -370,6 +446,7 @@ static void draw_spectrum(const float *spec, int bins)
     for (int y = SPEC_Y0; y < (rs ? SPEC_Y0 + SPEC_H : WF_Y0 + WF_H); y++) LBUF[(size_t)y * LW + cx] = COL_LINE;
     if (s_mode == DSP_MODE_RS41) draw_rs41_panel();
     else if (s_mode == DSP_MODE_FT8) draw_ft8_panel();
+    else if (s_mode == DSP_MODE_WSPR) draw_wspr_panel();
 }
 
 /* ---- control band -------------------------------------------------------- */
@@ -379,21 +456,23 @@ static const box_t B_TDN  = {  6, 220, 56, 44};  /* tune down one step */
 static const box_t B_STEP = { 66, 220, 96, 44};  /* cycle step size    */
 static const box_t B_TUP  = {166, 220, 56, 44};  /* tune up one step   */
 static const box_t B_RS41 = {256, 220, 92, 44};  /* RS41 mode; pressed again in RS41 mode = centre on the strongest peak */
-static const box_t B_GAIN = {370, 220, 48, 44};  /* tuner gain: AGC / manual steps */
+static const box_t B_GAIN = {380, 220, 48, 44};  /* tuner gain: AGC / manual steps */
 static const box_t B_HF   = {  6, 272, 108, 44};
 static const box_t B_VHF  = {118, 272, 108, 44};
 static const box_t B_UHF  = {230, 272, 108, 44};
-/* Mode row: WFM NFM AM USB LSB CW FT8 — 7 buttons, 52 px wide, 3 px gap (RS41 has its own button). */
-static const uint8_t MODE_ROW[] = {DSP_MODE_WFM, DSP_MODE_NFM, DSP_MODE_AM, DSP_MODE_USB, DSP_MODE_LSB, DSP_MODE_CW, DSP_MODE_FT8};
+static const box_t B_PSK  = {344, 272, 104, 44}; /* PSK Reporter upload checkbox */
+/* Mode row: WFM NFM AM USB LSB CW FT8 WSPR — 8 buttons, 52 px wide, 3 px gap (RS41 has its own
+ * button). The row ends at x = 443; VOL/SQL start at x = 454. */
+static const uint8_t MODE_ROW[] = {DSP_MODE_WFM, DSP_MODE_NFM, DSP_MODE_AM, DSP_MODE_USB, DSP_MODE_LSB, DSP_MODE_CW, DSP_MODE_FT8, DSP_MODE_WSPR};
 #define N_MODE_ROW (int)(sizeof(MODE_ROW) / sizeof(MODE_ROW[0]))
 #define MODE_BTN_W 52
 #define MODE_BTN_X(i) (6 + (i) * (MODE_BTN_W + 3))
 #define MODE_BTN_Y 322
 #define MODE_BTN_H 36
-static const box_t B_VDN  = {456, 226, 46, 44};
-static const box_t B_VUP  = {592, 226, 46, 44};
-static const box_t B_SDN  = {456, 300, 46, 44};
-static const box_t B_SUP  = {592, 300, 46, 44};
+static const box_t B_VDN  = {454, 226, 46, 44};
+static const box_t B_VUP  = {590, 226, 46, 44};
+static const box_t B_SDN  = {454, 300, 46, 44};
+static const box_t B_SUP  = {590, 300, 46, 44};
 
 static void draw_box(const box_t *b, const char *label, int sc, uint16_t fill)
 {
@@ -425,6 +504,12 @@ static void draw_controls(void)
     draw_box(&B_HF, "HF", 2, COL_BTN);
     draw_box(&B_VHF, "VHF", 2, COL_BTN);
     draw_box(&B_UHF, "UHF", 2, COL_BTN);
+    { /* PSK Reporter upload checkbox: green = enabled + online, amber = enabled, no link yet */
+        int st = psk_status();
+        draw_box(&B_PSK, "PSK", 2, COL_BTN);
+        rect(B_PSK.x + 10, B_PSK.y + 13, 18, 18, COL_TEXT);
+        if (st) rect(B_PSK.x + 13, B_PSK.y + 16, 12, 12, st == 2 ? RGB565(40, 190, 90) : RGB565(220, 170, 40));
+    }
 
     char v[8];
     text(530, 212, 2, COL_TEXT, "VOL");
@@ -471,6 +556,32 @@ static const uint32_t FT8_FREQS[] = {1840000, 3573000, 5357000, 7074000, 1013600
 #define N_FT8_FREQS (int)(sizeof(FT8_FREQS) / sizeof(FT8_FREQS[0]))
 static int s_ft8_i = 3; /* 20 m */
 
+/* WSPR dial frequencies (USB; the signals sit at 1400..1600 Hz audio): 160, 80, 60, 40, 30, 20,
+ * 17, 15, 12, 10 and 6 m. */
+static const uint32_t WSPR_FREQS[] = {1836600, 3568600, 5287200, 7038600, 10138700, 14095600,
+                                      18104600, 21094600, 24924600, 28124600, 50293000};
+#define N_WSPR_FREQS (int)(sizeof(WSPR_FREQS) / sizeof(WSPR_FREQS[0]))
+static int s_wspr_i = 5; /* 20 m */
+
+/* Digital-mode button: narrow 96 kHz view, 100 Hz step; pressed again = next frequency of the
+ * list, otherwise keep the dial if it is already on one of the frequencies, else jump to the
+ * last used one. */
+static void digital_preset(const uint32_t *list, int n, int *idx, bool again)
+{
+    set_rate(288000);
+    set_step_hz(100);
+    if (again) {
+        *idx = (*idx + 1) % n;
+        retune(list[*idx]);
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        int64_t d = (int64_t)s_center - (int64_t)list[i];
+        if (d > -3000 && d < 3000) { *idx = i; return; }
+    }
+    retune(list[*idx]);
+}
+
 /* Retune so the strongest peak in the current spectrum sits on the centre line.
  * Uses the power-weighted centroid of the peak (bin spacing = span / bins: 1.152 MHz or, in HF mode, 96 kHz). */
 static void snap_to_peak(void)
@@ -503,8 +614,10 @@ static void snap_to_peak(void)
 static void set_mode(int mode)
 {
     if (mode < 0 || mode >= DSP_MODE_COUNT) mode = DSP_MODE_WFM;
-    if ((s_mode == DSP_MODE_RS41 || s_mode == DSP_MODE_FT8) && mode != DSP_MODE_RS41 && mode != DSP_MODE_FT8)
+    if (is_panel_mode(s_mode) && !is_panel_mode(mode)) {
         rect(0, WF_Y0, LW, WF_H, RGB565(0, 0, 0)); /* clear the text panel */
+        s_panel_mode = -1;
+    }
     s_mode = mode;
     dsp_set_mode(mode);
 }
@@ -512,7 +625,7 @@ static void set_mode(int mode)
 /* A mode button was pressed: select the mode and its sensible defaults. */
 static void mode_button(int m)
 {
-    const bool was_ft8 = (s_mode == DSP_MODE_FT8);
+    const bool again = (s_mode == m); /* same mode pressed twice */
     set_mode(m);
     s_label = "MANUAL";
     /* sensible default step: 100 Hz for SSB/CW (SSB needs ~50 Hz accuracy), 25 kHz otherwise */
@@ -522,20 +635,11 @@ static void mode_button(int m)
         /* sondes live at 400-406 MHz; jump there if we're elsewhere */
         if (s_center < 400000000u || s_center > 406000000u) retune(403000000);
     } else if (m == DSP_MODE_FT8) {
-        set_rate(288000); /* narrow 96 kHz view, like HF */
-        set_step_hz(100);
-        if (was_ft8) { /* pressed again: next FT8 band */
-            s_ft8_i = (s_ft8_i + 1) % N_FT8_FREQS;
-            retune(FT8_FREQS[s_ft8_i]);
-        } else {
-            bool near = false; /* already on an FT8 frequency? keep it */
-            for (int i = 0; i < N_FT8_FREQS; i++) {
-                int64_t d = (int64_t)s_center - (int64_t)FT8_FREQS[i];
-                if (d > -3000 && d < 3000) { s_ft8_i = i; near = true; break; }
-            }
-            if (!near) retune(FT8_FREQS[s_ft8_i]);
-        }
+        digital_preset(FT8_FREQS, N_FT8_FREQS, &s_ft8_i, again);
         s_label = "FT8";
+    } else if (m == DSP_MODE_WSPR) {
+        digital_preset(WSPR_FREQS, N_WSPR_FREQS, &s_wspr_i, again);
+        s_label = "WSPR";
     } else if (m >= DSP_MODE_USB) s_step_i = 0;
     else if (STEPS[s_step_i] < 1000) s_step_i = 6;
 }
@@ -617,7 +721,8 @@ static bool hit(const box_t *b, int x, int y)
 static bool handle_touch(void)
 {
     static bool prev = false, dragging = false;
-    static int drag_x0;
+    static int drag_x0, tap_y;
+    static bool tap_moved;
     static uint32_t drag_f0;
     static int grace = 0;    /* ignore touches briefly after boot */
     static int run = 0;      /* consecutive raw-pressed samples (debounce) */
@@ -647,8 +752,9 @@ static bool handle_touch(void)
 
     if (pressed && ly < CTRL_Y0) {
         /* drag the spectrum/waterfall to scan */
-        if (edge) { dragging = true; drag_x0 = lx; drag_f0 = s_center; }
+        if (edge) { dragging = true; drag_x0 = lx; drag_f0 = s_center; tap_moved = false; tap_y = ly; }
         else if (dragging) {
+            if (lx - drag_x0 > 6 || drag_x0 - lx > 6) tap_moved = true;
             int64_t df = -(int64_t)(lx - drag_x0) * DRAG_HZ_PER_PX;
             retune((int64_t)drag_f0 + df);
             s_label = "MANUAL";
@@ -682,6 +788,8 @@ static bool handle_touch(void)
             band_press(BAND_VHF, BM_VHF, BM_VHF_N, &s_bm_vhf, "VHF LAST"); changed = true;
         } else if (hit(&B_UHF, lx, ly)) {
             band_press(BAND_UHF, BM_UHF, BM_UHF_N, &s_bm_uhf, "UHF LAST"); changed = true;
+        } else if (hit(&B_PSK, lx, ly)) {
+            psk_set_enabled(!psk_enabled()); changed = true;
         } else if (hit(&B_VDN, lx, ly)) {
             s_volume -= VOL_STEP; if (s_volume < 0) s_volume = 0;
             audio_set_volume(s_volume); changed = true;
@@ -697,7 +805,11 @@ static bool handle_touch(void)
         }
     }
 
-    if (!pressed) dragging = false;
+    if (!pressed) {
+        /* a tap (no movement) on the WSPR text panel runs the decoder self-test */
+        if (dragging && !tap_moved && s_mode == DSP_MODE_WSPR && tap_y >= WF_Y0) { wspr_selftest(); changed = true; }
+        dragging = false;
+    }
     prev = pressed;
     return changed;
 }
@@ -730,8 +842,11 @@ static void ui_task(void *arg)
     const float *last = NULL;
     int bins = dsp_spectrum_bins();
     int meter_div = 0;
+    int last_psk = -1; 
     while (1) {
         bool dirty = handle_touch();
+        int ps = psk_status(); /* PSK box follows WiFi/SNTP state by itself */
+        if (ps != last_psk) { last_psk = ps; dirty = true; }
         const float *spec = dsp_spectrum();
         bool newspec = spec && spec != last;
         if (newspec) {
@@ -741,7 +856,7 @@ static void ui_task(void *arg)
         }
         if (dirty) { draw_controls(); draw_header(); }
         if (newspec || dirty) present();
-        vTaskDelay(pdMS_TO_TICKS(8));
+        vTaskDelay(pdMS_TO_TICKS(is_panel_mode(s_mode) ? 30 : 8)); /* text panels: ~30 fps is plenty, and the decoders need CPU */
     }
 }
 

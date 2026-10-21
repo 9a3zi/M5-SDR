@@ -27,6 +27,11 @@
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "psk.h"
+#include "sdr.h"
+#define FT8_YIELD() vTaskDelay(1) /* let the UI and the idle task run during long decodes */
+#else
+#define FT8_YIELD() ((void)0)
 #endif
 
 static const char *TAG = "ft8";
@@ -57,7 +62,7 @@ static const char *TAG = "ft8";
 #define LDPC_ITER      25
 #define MAX_DECODED    50
 
-#define RING_N      65536                 /* 12 kHz samples (5.5 s)               */
+#define RING_N      131072                /* 12 kHz samples (10.9 s)              */
 #define MSG_N       24
 #define SCAN_STEP   16                    /* blocks between scan attempts (2.56 s) */
 #define EMPTY_UNLOCK 6                    /* empty slots before re-scanning        */
@@ -341,6 +346,7 @@ static int decode_window(int64_t ws, int nblk)
 
     for (int i = 0; i < ncand && ndec < MAX_DECODED; i++) {
         const ftx_candidate_t *c = &cands[i];
+        if ((i & 7) == 7) FT8_YIELD();
         ftx_message_t msg;
         ftx_decode_status_t st;
         if (!ftx_decode_candidate(&wf, c, LDPC_ITER, &msg, &st)) continue;
@@ -427,6 +433,14 @@ static void add_message(const dec_t *d, int64_t boundary, uint16_t slot)
     s_msg_total++;
     s_stat.total = s_msg_total;
     __atomic_store_n(&s_lockseq, s_lockseq + 1, __ATOMIC_RELEASE);
+
+#ifdef ESP_PLATFORM
+    { /* upload to PSK Reporter: RF freq = dial centre + audio tone */
+        sdr_stats_t sst;
+        sdr_get_stats(&sst);
+        psk_spot_msg(d->text, (double)sst.center_freq + (double)d->freq, d->snr, "FT8");
+    }
+#endif
 }
 
 int ft8_get_messages(ft8_msg_t *out, int max, ft8_status_t *st)
@@ -619,7 +633,7 @@ void ft8_start(void)
     static int started;
     if (!started) {
         started = 1;
-        xTaskCreatePinnedToCore(ft8_task, "ft8", 24 * 1024, NULL, 2, NULL, 0);
+        xTaskCreatePinnedToCore(ft8_task, "ft8", 24 * 1024, NULL, 3, NULL, 0); /* below the UI task (6) */
     }
 #endif
 }

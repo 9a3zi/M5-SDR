@@ -26,6 +26,7 @@ enum {
                       /* frequency minus pitch, like a normal SSB radio)   */
     DSP_MODE_RS41 = 6, /* Vaisala RS41 radiosonde, 4800 baud GFSK (see rs41.h) */
     DSP_MODE_FT8 = 7,  /* FT8 weak-signal digital mode: USB audio → ft8.c       */
+    DSP_MODE_WSPR = 8, /* WSPR beacon mode: USB audio → wspr.c                  */
     DSP_MODE_COUNT
 };
 
