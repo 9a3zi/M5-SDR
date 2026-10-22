@@ -91,7 +91,7 @@ static int s_bm_hf = 0, s_bm_vhf = 0, s_bm_uhf = 0; /* per-band preset cursor */
 static uint32_t s_rate_cur = 1152000; /* RTL2832 sample rate currently selected */
 
 /* Tuning step (Hz) applied by the [-]/[+] buttons; STEP button cycles it. */
-static const uint32_t STEPS[] = {100, 500, 1000, 5000, 25000, 100000, 1000000};
+static const uint32_t STEPS[] = {100, 500, 1000, 5000, 6250, 12500, 25000, 100000, 1000000};
 #define N_STEPS ((int)(sizeof(STEPS) / sizeof(STEPS[0])))
 static int s_step_i = 6; /* default 25 kHz */
 
@@ -561,8 +561,17 @@ static void retune(int64_t hz)
 {
     if (hz < FREQ_MIN) hz = FREQ_MIN;
     if (hz > FREQ_MAX) hz = FREQ_MAX;
+    int64_t old = s_center;
     s_center = (uint32_t)hz;
     sdr_set_center_freq(s_center);
+    /* Moved off the current FT8/WSPR sub-band (>5 kHz): drop the stale decode
+     * list, the stations below the new dial are different ones. Small
+     * within-band nudges keep the list. */
+    int64_t d = hz > old ? hz - old : old - hz;
+    if (d > 5000) {
+        if (s_mode == DSP_MODE_FT8) ft8_reset();
+        else if (s_mode == DSP_MODE_WSPR) wspr_reset();
+    }
 }
 
 /* Switch the RTL2832 sample rate and tell the DSP (both are applied live). */
@@ -787,7 +796,8 @@ static int s_menu;
 static void menu_close(void)
 {
     s_menu = 0;
-    rect(0, WF_Y0, LW, WF_H, RGB565(0, 0, 0)); /* clear the panel/waterfall area the menu drew over */
+    rect(0, 0, LW, LH, COL_BG);                 /* the menu drew over the whole screen, header + controls background included */
+    rect(0, WF_Y0, LW, WF_H, RGB565(0, 0, 0)); /* panel / waterfall area */
     s_panel_mode = -1;                          /* force the text-panel body to redraw */
 }
 
