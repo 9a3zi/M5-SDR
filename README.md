@@ -16,6 +16,7 @@ out the built-in speaker.
 - **Touch UI**: drag the waterfall to scan, fine-step tuning, volume, squelch,
   and one-tap **band buttons** (HF 14 MHz USB, VHF 144 MHz NFM, UHF 430 MHz NFM).
 - AGC, Squelch, Volume...etc... controll
+- Schedule receiving wspr/ft8 configure via PLAN button menu. (new version 1.2)
 
 ## Hardware
 
