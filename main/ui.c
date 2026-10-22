@@ -74,7 +74,7 @@ static const char *TAG = "ui";
 
 /* Startup splash: full-screen welcome banner shown for a few seconds after
  * boot. Edit the callsign/text to your own. */
-#define SPLASH_TITLE "TAB-5 SDR"
+#define SPLASH_TITLE "M5-SDR"
 #define SPLASH_CALL  "9A3ZI"
 #define SPLASH_MS    2500
 
