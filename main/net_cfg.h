@@ -13,13 +13,18 @@
 #define NET_WIFI_SSID     "WIFI-SSID"
 #define NET_WIFI_PASSWORD "password"
 
+/* Timezone for the band-plan scheduler (POSIX TZ string; SNTP syncs UTC and
+ * this converts it to local time for the schedule). Central European Time
+ * with DST is the default — change to your zone, e.g. "UTC0", "EST5EDT", … */
+#define NET_TZ            "CET-1CEST,M3.5.0,M10.5.0/3"
+
 /* ---- PSK Reporter identity ------------------------------------------------ */
 /* Your callsign as the receiving station (uploaded with every report). */
 #define PSK_CALLSIGN      "CALLSIGN"
 /* Your locator, 4 or 6 characters (e.g. "JN76", "FN42AB"). */
-#define PSK_GRID          "QTH-LOC"
+#define PSK_GRID          "LOC"
 /* Software descriptor shown on pskreporter.info. */
-#define PSK_SW_NAME       "Tab5-SDR v1.0"
+#define PSK_SW_NAME       "Tab5-SDR v1.2"
 /* Receiver rig description (optional rigInformation field, 30351.13). */
 #define PSK_RIG           "M5Stack Tab5 + RTL-SDR"
 

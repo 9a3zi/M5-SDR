@@ -1,6 +1,6 @@
 idf_component_register(
     SRCS "main.c" "sdr.c" "dsp.c" "audio.c" "ui.c" "rs41.c" "ft8.c" "wspr.c"
-         "wifi_net.c" "psk.c"
+         "wifi_net.c" "psk.c" "bandplan.c"
          "ft8lib/ft8/constants.c" "ft8lib/ft8/crc.c" "ft8lib/ft8/decode.c" "ft8lib/ft8/encode.c"
          "ft8lib/ft8/ldpc.c" "ft8lib/ft8/message.c" "ft8lib/ft8/text.c"
          "ft8lib/fft/kiss_fft.c" "ft8lib/fft/kiss_fftr.c"

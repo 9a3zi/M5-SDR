@@ -6,7 +6,9 @@
  * Touch maps back: lx = (1280 - panel_y)/2,  ly = panel_x/2.
  *
  * Controls: drag spectrum/waterfall to scan fast; [-1][-.1][+.1][+1] tune;
- * mode row WFM/NFM/AM/USB/LSB/CW/FT8, RS41 button (press again = centre on peak); HF/VHF/UHF band buttons; volume +/- ;
+ * mode row WFM/NFM/AM/USB/LSB/CW/FT8/WSPR, RS41 button (press again = centre on peak);
+ * HF/VHF/UHF band buttons; PLAN button: time-scheduled band hopping for
+ * FT8/WSPR (menu: OFF / FT8 PLAN / WSPR PLAN / USER PLAN / editor); volume +/- ;
  * squelch +/-.
  */
 #include "ui.h"
@@ -30,6 +32,7 @@
 #include "audio.h"
 #include "bookmarks.h"
 #include "psk.h"
+#include "bandplan.h"
 
 static const char *TAG = "ui";
 
@@ -68,6 +71,12 @@ static const char *TAG = "ui";
 #define COL_BTN    RGB565(40, 60, 110)
 #define COL_BTN_HI RGB565(80, 110, 180)
 #define COL_TRACK  RGB565(50, 56, 78)
+
+/* Startup splash: full-screen welcome banner shown for a few seconds after
+ * boot. Edit the callsign/text to your own. */
+#define SPLASH_TITLE "TAB-5 SDR"
+#define SPLASH_CALL  "9A3ZI"
+#define SPLASH_MS    2500
 
 static uint16_t *LBUF;
 static ppa_client_handle_t s_ppa;
@@ -452,11 +461,12 @@ static void draw_spectrum(const float *spec, int bins)
 /* ---- control band -------------------------------------------------------- */
 
 typedef struct { int x, y, w, h; } box_t;
-static const box_t B_TDN  = {  6, 220, 56, 44};  /* tune down one step */
-static const box_t B_STEP = { 66, 220, 96, 44};  /* cycle step size    */
-static const box_t B_TUP  = {166, 220, 56, 44};  /* tune up one step   */
-static const box_t B_RS41 = {256, 220, 92, 44};  /* RS41 mode; pressed again in RS41 mode = centre on the strongest peak */
-static const box_t B_GAIN = {380, 220, 48, 44};  /* tuner gain: AGC / manual steps */
+static const box_t B_TDN  = {  6, 220, 52, 44};  /* tune down one step */
+static const box_t B_STEP = { 62, 220, 84, 44};  /* cycle step size    */
+static const box_t B_TUP  = {150, 220, 52, 44};  /* tune up one step   */
+static const box_t B_RS41 = {210, 220, 88, 44};  /* RS41 mode; pressed again in RS41 mode = centre on the strongest peak */
+static const box_t B_GAIN = {306, 220, 44, 44};  /* tuner gain: AGC / manual steps */
+static const box_t B_PLAN = {358, 220, 88, 44};  /* band-plan menu: time-scheduled FT8/WSPR band hopping */
 static const box_t B_HF   = {  6, 272, 108, 44};
 static const box_t B_VHF  = {118, 272, 108, 44};
 static const box_t B_UHF  = {230, 272, 108, 44};
@@ -496,6 +506,26 @@ static void draw_controls(void)
         else snprintf(gl, sizeof gl, "G%d", (GAINS[s_gain_i] / 10) % 100); /* 2 digits */
         draw_box(&B_GAIN, gl, 2, GAINS[s_gain_i] < 0 ? COL_BTN : RGB565(90, 70, 40));
     }
+    { /* band-plan button: green while a plan is armed, status line under the label */
+        bool on = bandplan_active() != BP_OFF;
+        rect(B_PLAN.x, B_PLAN.y, B_PLAN.w, B_PLAN.h, on ? RGB565(24, 110, 70) : COL_BTN);
+        rect(B_PLAN.x, B_PLAN.y, B_PLAN.w, 2, COL_BTN_HI);
+        text(B_PLAN.x + (B_PLAN.w - text_w("PLAN", 2)) / 2, B_PLAN.y + 4, 2, COL_TEXT, "PLAN");
+        if (on) {
+            bp_slot_t cur;
+            char bn[8];
+            if (bandplan_current(&cur)) {
+                char st[24];
+                snprintf(st, sizeof st, "%s %s", dsp_mode_name(cur.mode),
+                         bandplan_band_name(bandplan_slot_freq(&cur), bn, sizeof bn));
+                text(B_PLAN.x + (B_PLAN.w - text_w(st, 1)) / 2, B_PLAN.y + 28, 1, RGB565(190, 255, 210), st);
+            } else {
+                const char *warn = (bandplan_active() == BP_USER && bandplan_user_n() == 0) ? "EMPTY" : "NO CLOCK";
+                text(B_PLAN.x + (B_PLAN.w - text_w(warn, 1)) / 2, B_PLAN.y + 28, 1,
+                     RGB565(255, 200, 90), warn);
+            }
+        }
+    }
     for (int i = 0; i < N_MODE_ROW; i++) {
         int m = MODE_ROW[i];
         box_t b = { MODE_BTN_X(i), MODE_BTN_Y, MODE_BTN_W, MODE_BTN_H };
@@ -516,13 +546,13 @@ static void draw_controls(void)
     draw_box(&B_VDN, "-", 3, COL_BTN);
     draw_box(&B_VUP, "+", 3, COL_BTN);
     snprintf(v, sizeof v, "%d", s_volume);
-    text(530, 238, 3, COL_LINE, v);
+    text(520, 238, 3, COL_LINE, v);
 
     text(530, 286, 2, COL_TEXT, "SQL");
     draw_box(&B_SDN, "-", 3, COL_BTN);
     draw_box(&B_SUP, "+", 3, COL_BTN);
     snprintf(v, sizeof v, "%d", s_squelch);
-    text(520, 312, 3, COL_LINE, v);
+    text(516, 312, 3, COL_LINE, v);
 }
 
 /* ---- actions ------------------------------------------------------------- */
@@ -551,16 +581,9 @@ static void set_step_hz(uint32_t hz)
         if (STEPS[i] == hz) { s_step_i = i; return; }
 }
 
-/* Standard FT8 dial frequencies (USB): 80, 40, 30, 20, 17, 15, 12, 10 m. */
-static const uint32_t FT8_FREQS[] = {1840000, 3573000, 5357000, 7074000, 10136000, 14074000, 18100000, 21074000, 24915000, 28074000, 50313000};
-#define N_FT8_FREQS (int)(sizeof(FT8_FREQS) / sizeof(FT8_FREQS[0]))
+/* FT8/WSPR dial-frequency tables now live in bandplan.c (shared with the scheduler);
+ * the cursors below are just the manual-preset positions. */
 static int s_ft8_i = 3; /* 20 m */
-
-/* WSPR dial frequencies (USB; the signals sit at 1400..1600 Hz audio): 160, 80, 60, 40, 30, 20,
- * 17, 15, 12, 10 and 6 m. */
-static const uint32_t WSPR_FREQS[] = {1836600, 3568600, 5287200, 7038600, 10138700, 14095600,
-                                      18104600, 21094600, 24924600, 28124600, 50293000};
-#define N_WSPR_FREQS (int)(sizeof(WSPR_FREQS) / sizeof(WSPR_FREQS[0]))
 static int s_wspr_i = 5; /* 20 m */
 
 /* Digital-mode button: narrow 96 kHz view, 100 Hz step; pressed again = next frequency of the
@@ -622,6 +645,20 @@ static void set_mode(int mode)
     dsp_set_mode(mode);
 }
 
+/* Band-plan hook (bandplan.c): retune to the scheduled slot. Runs in the UI
+ * task context; switches mode + rate like a digital-mode preset. */
+static char s_plan_label[24];
+static void plan_apply(int mode, uint32_t freq)
+{
+    set_rate(288000);
+    set_step_hz(100);
+    set_mode(mode);
+    retune((int64_t)freq);
+    char bn[8];
+    snprintf(s_plan_label, sizeof s_plan_label, "PLAN %s", bandplan_band_name(freq, bn, sizeof bn));
+    s_label = s_plan_label;
+}
+
 /* A mode button was pressed: select the mode and its sensible defaults. */
 static void mode_button(int m)
 {
@@ -635,10 +672,14 @@ static void mode_button(int m)
         /* sondes live at 400-406 MHz; jump there if we're elsewhere */
         if (s_center < 400000000u || s_center > 406000000u) retune(403000000);
     } else if (m == DSP_MODE_FT8) {
-        digital_preset(FT8_FREQS, N_FT8_FREQS, &s_ft8_i, again);
+        int n;
+        const uint32_t *f = bandplan_ft8_freqs(&n);
+        digital_preset(f, n, &s_ft8_i, again);
         s_label = "FT8";
     } else if (m == DSP_MODE_WSPR) {
-        digital_preset(WSPR_FREQS, N_WSPR_FREQS, &s_wspr_i, again);
+        int n;
+        const uint32_t *f = bandplan_wspr_freqs(&n);
+        digital_preset(f, n, &s_wspr_i, again);
         s_label = "WSPR";
     } else if (m >= DSP_MODE_USB) s_step_i = 0;
     else if (STEPS[s_step_i] < 1000) s_step_i = 6;
@@ -718,6 +759,168 @@ static bool hit(const box_t *b, int x, int y)
     return x >= b->x && x < b->x + b->w && y >= b->y && y < b->y + b->h;
 }
 
+/* ---- band-plan menu --------------------------------------------------------
+ * s_menu: 0 = closed, 1 = plan list, 2 = USER-plan editor. While a menu is
+ * open it owns the whole screen and all touches; the normal controls are
+ * unreachable until it is closed. */
+
+static int s_menu;
+
+/* Plan list rows: 4 plans + EDIT USER PLAN + CLOSE. */
+#define M1_ROWS      6
+#define M1_ROW_Y0    48
+#define M1_ROW_PITCH 36
+#define M1_ROW_H     30
+#define M1_ROW_X     16
+#define M1_ROW_W     608
+
+/* USER-plan editor rows: one per slot + ADD SLOT + BACK. Tap zones per row:
+ * hour (24 h wrap per tap), mode (FT8<->WSPR), band (next band of the mode),
+ * X = delete the row. */
+#define E_ROW_Y0    48
+#define E_ROW_PITCH 22
+#define E_HOUR_X    24
+#define E_MODE_X    130
+#define E_BAND_X    250
+#define E_DEL_X     560
+
+static void menu_close(void)
+{
+    s_menu = 0;
+    rect(0, WF_Y0, LW, WF_H, RGB565(0, 0, 0)); /* clear the panel/waterfall area the menu drew over */
+    s_panel_mode = -1;                          /* force the text-panel body to redraw */
+}
+
+static void menu_status(char *b, size_t n)
+{
+    if (!bandplan_time_ok()) {
+        snprintf(b, n, "CLOCK NOT SET - PLANNER NEEDS WIFI + SNTP TIME SYNC");
+        return;
+    }
+    int hh, mm;
+    bandplan_now_hm(&hh, &mm);
+    if (bandplan_active() == BP_OFF) {
+        snprintf(b, n, "NOW %02d:%02d  PLANNER OFF", hh, mm);
+        return;
+    }
+    bp_slot_t cur;
+    if (bandplan_current(&cur)) {
+        char bn[8];
+        snprintf(b, n, "NOW %02d:%02d  %s %s UNTIL %02d:00", hh, mm,
+                 dsp_mode_name(cur.mode), bandplan_band_name(bandplan_slot_freq(&cur), bn, sizeof bn),
+                 bandplan_current_until());
+    } else {
+        snprintf(b, n, "NOW %02d:%02d  %s EMPTY", hh, mm, bandplan_name(bandplan_active()));
+    }
+}
+
+static void plan_info(int plan, char *b, size_t n)
+{
+    switch (plan) {
+    case BP_OFF:  snprintf(b, n, "NO AUTOMATIC BAND CHANGES"); break;
+    case BP_FT8:  snprintf(b, n, "10 SLOTS  8 BANDS  80-10M"); break;
+    case BP_WSPR: snprintf(b, n, "12 SLOTS  11 BANDS  160-6M"); break;
+    default: {
+        int c = bandplan_user_n();
+        if (c) snprintf(b, n, "%d SLOTS", c);
+        else snprintf(b, n, "EMPTY - EDIT TO ADD SLOTS");
+    }
+    }
+}
+
+static void draw_menu(void)
+{
+    rect(0, 0, LW, LH, RGB565(10, 14, 30));
+    char b[96];
+    if (s_menu == 1) {
+        text(6, 4, 2, COL_ACCENT, "BAND PLAN");
+        menu_status(b, sizeof b);
+        text(6, 26, 1, COL_TEXT, b);
+        for (int i = 0; i < M1_ROWS; i++) {
+            box_t r = {M1_ROW_X, M1_ROW_Y0 + i * M1_ROW_PITCH, M1_ROW_W, M1_ROW_H};
+            bool sel = (i < 4) && bandplan_active() == i;
+            rect(r.x, r.y, r.w, r.h, sel ? RGB565(30, 110, 75) : COL_BTN);
+            rect(r.x, r.y, r.w, 2, COL_BTN_HI);
+            text(r.x + 12, r.y + 8, 2, COL_TEXT, (i < 4) ? bandplan_name(i) : (i == 4 ? "EDIT USER PLAN" : "CLOSE"));
+            if (i < 4) {
+                plan_info(i, b, sizeof b);
+                text(r.x + 300, r.y + 11, 1, RGB565(170, 180, 200), b);
+            }
+        }
+        return;
+    }
+    /* USER-plan editor */
+    text(6, 4, 2, COL_ACCENT, "EDIT USER PLAN");
+    text(6, 26, 1, COL_TEXT, "TAP HOUR MODE OR BAND TO CHANGE    X = DELETE");
+    int n = bandplan_user_n();
+    for (int i = 0; i < n + 2; i++) {
+        int ry = E_ROW_Y0 + i * E_ROW_PITCH;
+        if (i < n) {
+            bp_slot_t s = bandplan_user_get(i);
+            char t[8], bn[8];
+            snprintf(t, sizeof t, "%02d", s.hour);
+            text(E_HOUR_X, ry + 3, 2, COL_LINE, t);
+            text(E_MODE_X, ry + 3, 2, COL_TEXT, dsp_mode_name(s.mode));
+            text(E_BAND_X, ry + 3, 2, RGB565(120, 220, 255), bandplan_band_name(bandplan_slot_freq(&s), bn, sizeof bn));
+            text(E_DEL_X, ry + 3, 2, RGB565(255, 120, 120), "X");
+            /* tap-zone underlines */
+            rect(E_HOUR_X, ry + 19, 24, 1, RGB565(60, 70, 100));
+            rect(E_MODE_X, ry + 19, 48, 1, RGB565(60, 70, 100));
+            rect(E_BAND_X, ry + 19, 40, 1, RGB565(60, 70, 100));
+        } else {
+            rect(E_HOUR_X - 8, ry + 1, 130, 20, (i == n) ? RGB565(40, 80, 60) : RGB565(60, 60, 90));
+            text(E_HOUR_X, ry + 3, 2, COL_TEXT, (i == n) ? "ADD SLOT" : "BACK");
+        }
+    }
+}
+
+static bool menu_touch(int x, int y)
+{
+    if (s_menu == 1) {
+        for (int i = 0; i < M1_ROWS; i++) {
+            box_t r = {M1_ROW_X, M1_ROW_Y0 + i * M1_ROW_PITCH, M1_ROW_W, M1_ROW_H};
+            if (hit(&r, x, y)) {
+                if (i < 4) { bandplan_select(i); menu_close(); }
+                else if (i == 4) s_menu = 2;
+                else menu_close();
+                return true;
+            }
+        }
+        menu_close(); /* tap outside the list dismisses */
+        return true;
+    }
+    /* editor */
+    int n = bandplan_user_n();
+    int row = (y - E_ROW_Y0) / E_ROW_PITCH;
+    if (y < E_ROW_Y0 || row < 0 || row >= n + 2) return false;
+    if (row < n) {
+        bp_slot_t s = bandplan_user_get(row);
+        int nb;
+        if (x >= E_DEL_X) { bandplan_user_del(row); return true; }
+        if (x < E_MODE_X) { s.hour = (s.hour + 1) % 24; bandplan_user_set(row, &s); return true; }
+        if (x < E_BAND_X) { /* toggle the mode; keep the band index valid for the new table */
+            s.mode = (s.mode == DSP_MODE_FT8) ? DSP_MODE_WSPR : DSP_MODE_FT8;
+            if (s.mode == DSP_MODE_WSPR) bandplan_wspr_freqs(&nb); else bandplan_ft8_freqs(&nb);
+            if (s.band >= nb) s.band = (uint8_t)(nb - 1);
+            bandplan_user_set(row, &s);
+            return true;
+        }
+        if (s.mode == DSP_MODE_WSPR) bandplan_wspr_freqs(&nb); else bandplan_ft8_freqs(&nb);
+        s.band = (uint8_t)((s.band + 1) % nb);
+        bandplan_user_set(row, &s);
+        return true;
+    }
+    if (x < E_HOUR_X - 8 || x >= E_HOUR_X - 8 + 130) return false; /* ADD SLOT / BACK zone only */
+    if (row == n) { /* ADD SLOT: next hour after the last slot, FT8 40 m default */
+        bp_slot_t s = {8, DSP_MODE_FT8, 1};
+        if (n > 0) { s = bandplan_user_get(n - 1); s.hour = (uint8_t)((s.hour + 1) % 24); s.band = 1; }
+        bandplan_user_add(&s);
+        return true;
+    }
+    s_menu = 1; /* BACK */
+    return true;
+}
+
 static bool handle_touch(void)
 {
     static bool prev = false, dragging = false;
@@ -749,6 +952,12 @@ static bool handle_touch(void)
         if (ly >= LH) ly = LH - 1;
     }
     bool edge = pressed && !prev;
+
+    if (s_menu) { /* an open menu owns the screen and all touches */
+        if (edge) changed = menu_touch(lx, ly);
+        prev = pressed;
+        return changed;
+    }
 
     if (pressed && ly < CTRL_Y0) {
         /* drag the spectrum/waterfall to scan */
@@ -790,6 +999,8 @@ static bool handle_touch(void)
             band_press(BAND_UHF, BM_UHF, BM_UHF_N, &s_bm_uhf, "UHF LAST"); changed = true;
         } else if (hit(&B_PSK, lx, ly)) {
             psk_set_enabled(!psk_enabled()); changed = true;
+        } else if (hit(&B_PLAN, lx, ly)) {
+            s_menu = 1; changed = true;
         } else if (hit(&B_VDN, lx, ly)) {
             s_volume -= VOL_STEP; if (s_volume < 0) s_volume = 0;
             audio_set_volume(s_volume); changed = true;
@@ -835,6 +1046,14 @@ static void ui_task(void *arg)
     (void)arg;
     rect(0, 0, LW, LH, COL_BG);
     rect(0, WF_Y0, LW, WF_H, RGB565(0, 0, 0));
+
+    /* welcome splash: title + callsign centred on the whole display */
+    rect(0, 0, LW, LH, COL_PANEL);
+    text((LW - text_w(SPLASH_TITLE, 6)) / 2, 126, 6, COL_ACCENT, SPLASH_TITLE);
+    text((LW - text_w(SPLASH_CALL, 4)) / 2, 180, 4, COL_LINE, SPLASH_CALL);
+    present();
+    vTaskDelay(pdMS_TO_TICKS(SPLASH_MS));
+
     draw_controls();
     draw_header();
     present();
@@ -842,9 +1061,15 @@ static void ui_task(void *arg)
     const float *last = NULL;
     int bins = dsp_spectrum_bins();
     int meter_div = 0;
-    int last_psk = -1; 
+    int last_psk = -1;
     while (1) {
         bool dirty = handle_touch();
+        if (bandplan_tick()) dirty = true; /* scheduler: apply the slot for the current hour */
+        if (s_menu) { /* an open menu owns the screen; the SDR keeps running underneath */
+            if (dirty) { draw_menu(); present(); }
+            vTaskDelay(pdMS_TO_TICKS(30));
+            continue;
+        }
         int ps = psk_status(); /* PSK box follows WiFi/SNTP state by itself */
         if (ps != last_psk) { last_psk = ps; dirty = true; }
         const float *spec = dsp_spectrum();
@@ -871,6 +1096,9 @@ void ui_start(void)
     s_center = st.center_freq;
     audio_set_volume(s_volume);
     apply_squelch();
+
+    bandplan_init();
+    bandplan_set_apply_cb(plan_apply);
 
     ESP_LOGI(TAG, "landscape UI %dx%d (PPA x%d)", LW, LH, SCALE);
     xTaskCreatePinnedToCore(ui_task, "ui", 8192, NULL, 6, NULL, 0);
