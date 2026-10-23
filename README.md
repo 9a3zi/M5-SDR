@@ -195,3 +195,4 @@ This project is licensed under the **GNU General Public License v2.0**
 
 Modifications to the vendored librtlsdr sources are documented inline (e.g. the
 `usb_host` shim and a missing `<string.h>` include for GCC 14).
+
