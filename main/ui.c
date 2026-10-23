@@ -8,8 +8,9 @@
  * Controls: drag spectrum/waterfall to scan fast; [-1][-.1][+.1][+1] tune;
  * mode row WFM/NFM/AM/USB/LSB/CW/FT8/WSPR, RS41 button (press again = centre on peak);
  * HF/VHF/UHF band buttons; PLAN button: time-scheduled band hopping for
- * FT8/WSPR (menu: OFF / FT8 PLAN / WSPR PLAN / USER PLAN / editor); volume +/- ;
- * squelch +/-.
+ * FT8/WSPR (menu: OFF / FT8 PLAN / WSPR PLAN / USER PLAN / editor / SCREEN OFF);
+ * volume +/- ; squelch +/-. The SCREEN OFF row sets the display-off (screensaver)
+ * delay; after the idle timeout the backlight turns off and any touch wakes it.
  */
 #include "ui.h"
 
@@ -21,6 +22,8 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "nvs.h"
+#include "nvs_flash.h"
 #include "driver/ppa.h"
 
 #include "bsp_tab5.h"
@@ -74,7 +77,7 @@ static const char *TAG = "ui";
 
 /* Startup splash: full-screen welcome banner shown for a few seconds after
  * boot. Edit the callsign/text to your own. */
-#define SPLASH_TITLE "TAB-5 SDR"
+#define SPLASH_TITLE "M5-SDR"
 #define SPLASH_CALL  "9A3ZI"
 #define SPLASH_MS    2500
 
@@ -91,7 +94,7 @@ static int s_bm_hf = 0, s_bm_vhf = 0, s_bm_uhf = 0; /* per-band preset cursor */
 static uint32_t s_rate_cur = 1152000; /* RTL2832 sample rate currently selected */
 
 /* Tuning step (Hz) applied by the [-]/[+] buttons; STEP button cycles it. */
-static const uint32_t STEPS[] = {100, 500, 1000, 5000, 6250, 12500, 25000, 100000, 1000000};
+static const uint32_t STEPS[] = {100, 500, 1000, 5000, 25000, 100000, 1000000};
 #define N_STEPS ((int)(sizeof(STEPS) / sizeof(STEPS[0])))
 static int s_step_i = 6; /* default 25 kHz */
 
@@ -768,6 +771,52 @@ static bool hit(const box_t *b, int x, int y)
     return x >= b->x && x < b->x + b->w && y >= b->y && y < b->y + b->h;
 }
 
+/* ---- screensaver (display off) ---------------------------------------------
+ * After the configured idle time the backlight is turned off (the SDR keeps
+ * running; nothing is rendered while the screen is off). Any touch turns the
+ * backlight back on and is consumed — waking the display never presses a
+ * button. The delay is set from a SCREEN OFF row in the PLAN menu and
+ * persisted in NVS ("ui"/"scroff"). */
+
+#define UI_BRIGHTNESS 80 /* must match main.c */
+
+static const uint32_t SCR_OFF_MS[]  = {0, 30000, 60000, 120000, 300000, 600000};
+static const char *const SCR_OFF_LBL[] = {"OFF", "30 S", "1 MIN", "2 MIN", "5 MIN", "10 MIN"};
+#define N_SCR_OFF ((int)(sizeof SCR_OFF_MS / sizeof SCR_OFF_MS[0]))
+
+static int s_scr_off_i = 0;                 /* selected delay index (0 = disabled) */
+static bool s_scr_off = false;              /* display currently off */
+static uint32_t s_last_touch_ms;            /* last activity (touch), ms ticks */
+
+static void scr_off_save(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("ui", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, "scroff", (uint8_t)s_scr_off_i);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+static void scr_off_load(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("ui", NVS_READONLY, &h) == ESP_OK) {
+        uint8_t v = 0;
+        if (nvs_get_u8(h, "scroff", &v) == ESP_OK && v < N_SCR_OFF) s_scr_off_i = v;
+        nvs_close(h);
+    }
+}
+
+static void scr_off_kick(void) { s_last_touch_ms = pdTICKS_TO_MS(xTaskGetTickCount()); }
+
+static void scr_off_set(bool off)
+{
+    if (off == s_scr_off) return;
+    s_scr_off = off;
+    bsp_tab5_display_set_brightness(off ? 0 : UI_BRIGHTNESS);
+}
+
 /* ---- band-plan menu --------------------------------------------------------
  * s_menu: 0 = closed, 1 = plan list, 2 = USER-plan editor. While a menu is
  * open it owns the whole screen and all touches; the normal controls are
@@ -775,8 +824,8 @@ static bool hit(const box_t *b, int x, int y)
 
 static int s_menu;
 
-/* Plan list rows: 4 plans + EDIT USER PLAN + CLOSE. */
-#define M1_ROWS      6
+/* Plan list rows: 4 plans + EDIT USER PLAN + SCREEN OFF + CLOSE. */
+#define M1_ROWS      7
 #define M1_ROW_Y0    48
 #define M1_ROW_PITCH 36
 #define M1_ROW_H     30
@@ -851,10 +900,14 @@ static void draw_menu(void)
             bool sel = (i < 4) && bandplan_active() == i;
             rect(r.x, r.y, r.w, r.h, sel ? RGB565(30, 110, 75) : COL_BTN);
             rect(r.x, r.y, r.w, 2, COL_BTN_HI);
-            text(r.x + 12, r.y + 8, 2, COL_TEXT, (i < 4) ? bandplan_name(i) : (i == 4 ? "EDIT USER PLAN" : "CLOSE"));
+            text(r.x + 12, r.y + 8, 2, COL_TEXT,
+                 (i < 4) ? bandplan_name(i) : (i == 4 ? "EDIT USER PLAN" : (i == 5 ? "SCREEN OFF" : "CLOSE")));
             if (i < 4) {
                 plan_info(i, b, sizeof b);
                 text(r.x + 300, r.y + 11, 1, RGB565(170, 180, 200), b);
+            } else if (i == 5) { /* screensaver delay; tap to cycle */
+                text(r.x + 300, r.y + 11, 1, s_scr_off_i ? RGB565(190, 255, 210) : RGB565(170, 180, 200),
+                     SCR_OFF_LBL[s_scr_off_i]);
             }
         }
         return;
@@ -892,6 +945,7 @@ static bool menu_touch(int x, int y)
             if (hit(&r, x, y)) {
                 if (i < 4) { bandplan_select(i); menu_close(); }
                 else if (i == 4) s_menu = 2;
+                else if (i == 5) { s_scr_off_i = (s_scr_off_i + 1) % N_SCR_OFF; scr_off_save(); }
                 else menu_close();
                 return true;
             }
@@ -952,6 +1006,14 @@ static bool handle_touch(void)
      * rejecting single-sample glitches. */
     run = (n > 0) ? run + 1 : 0;
     bool pressed = run >= 2;
+
+    if (s_scr_off) { /* screensaver: the touch only wakes the display */
+        if (pressed) { scr_off_set(false); scr_off_kick(); }
+        prev = pressed;
+        return false;
+    }
+    if (pressed) scr_off_kick();
+
     int lx = 0, ly = 0;
     if (pressed) {
         lx = (PANEL_H - p.y) / SCALE;
@@ -1072,9 +1134,15 @@ static void ui_task(void *arg)
     int bins = dsp_spectrum_bins();
     int meter_div = 0;
     int last_psk = -1;
+    scr_off_kick(); /* the splash counts as activity */
     while (1) {
         bool dirty = handle_touch();
         if (bandplan_tick()) dirty = true; /* scheduler: apply the slot for the current hour */
+        /* screensaver: idle timeout turns the backlight off; a touch wakes it */
+        if (!s_scr_off && SCR_OFF_MS[s_scr_off_i] &&
+            pdTICKS_TO_MS(xTaskGetTickCount()) - s_last_touch_ms >= SCR_OFF_MS[s_scr_off_i])
+            scr_off_set(true);
+        if (s_scr_off) { vTaskDelay(pdMS_TO_TICKS(50)); continue; } /* dark: nothing to render */
         if (s_menu) { /* an open menu owns the screen; the SDR keeps running underneath */
             if (dirty) { draw_menu(); present(); }
             vTaskDelay(pdMS_TO_TICKS(30));
@@ -1107,6 +1175,16 @@ void ui_start(void)
     audio_set_volume(s_volume);
     apply_squelch();
 
+    /* ui_start runs before wifi_net_init (which also inits NVS): make sure the
+     * flash is ready so the screensaver setting and the band plan load here. */
+    esp_err_t nvs_err = nvs_flash_init();
+    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        if (nvs_flash_erase() == ESP_OK) nvs_err = nvs_flash_init();
+    }
+    if (nvs_err != ESP_OK && nvs_err != ESP_ERR_INVALID_STATE)
+        ESP_LOGW(TAG, "nvs_flash_init: %s", esp_err_to_name(nvs_err));
+
+    scr_off_load();
     bandplan_init();
     bandplan_set_apply_cb(plan_apply);
 
