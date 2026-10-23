@@ -1,4 +1,4 @@
-# Tab5-SDR
+# M5-SDR
 
 A standalone **RTL-SDR receiver** that runs entirely on an **M5Stack Tab5**
 (ESP32-P4) — no PC required. Plug an RTL-SDR dongle into the Tab5's USB-A host
@@ -23,8 +23,7 @@ out the built-in speaker.
 - **M5Stack Tab5** (ESP32-P4 + ESP32-C6), 720×1280 MIPI-DSI panel.
 - An **RTL-SDR** dongle (RTL2832U + R820T/R828D) on the **USB-A** port — a short
   USB-A extension cable is recommended (clears the USB-C port and reduces noise).
-- The Tab5's **internal battery must be connected** — it browns out on USB power
-  alone, especially under the dongle's ~300 mA load.
+- The Tab5's with external power supply recommended
 
 > The USB-A port's 5 V VBUS is **off by default**; the firmware enables it at boot
 > (`bsp_tab5_set_usb_host_power`).
@@ -48,7 +47,7 @@ into `managed_components/` (pinned by `dependencies.lock`).
 
 - **Tune:** drag the spectrum/waterfall to scan (~100 MHz per swipe); `[-]`/`[+]`
   step by the selected **STEP** (1 k … 1 M, tap STEP to cycle); or tap a band button.
-- **Mode:** bottom-left row `WFM NFM AM USB LSB CW`. Broadcast FM = WFM; NOAA and
+- **Mode:** bottom- row `WFM NFM AM USB LSB CW`. Broadcast FM = WFM; and
   public-safety voice = NFM (the band buttons set this automatically).
 - **Volume / Squelch:** `[-]`/`[+]`. The SIG meter (top-right) shows signal level;
   the red marker is the squelch threshold — audio mutes below it.
@@ -177,7 +176,11 @@ cheaper.
 
 ## Credits & license
 
-This project is licensed under the **GNU General Public License v2.0 or later**
+This project is based on the original project: hardparking/tab5-sdr
+This repository contains additional modifications and features developed by 9a3zi and Kimi.
+Those contributions remain subject to the applicable license terms governing the combined project.
+
+This project is licensed under the **GNU General Public License v2.0**
 (see [LICENSE](LICENSE)), as required by librtlsdr.
 
 - **[librtlsdr](https://github.com/steve-m/librtlsdr)** — Steve Markgraf,
