@@ -18,7 +18,8 @@ out the built-in speaker.
 - AGC, Squelch, Volume...etc... controll
 - Schedule receiving wspr/ft8 configure via PLAN button menu. (new version 1.2)
 - Decode HORUS 4FSK V1, V2, V3
-- LoRa APRS receiving 
+- LoRa APRS receiving
+- AX25 AFSK1200 aprs 
 
 
 

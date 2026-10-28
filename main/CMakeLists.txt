@@ -1,6 +1,6 @@
 idf_component_register(
     SRCS
-        "main.c" "sdr.c" "dsp.c" "audio.c" "ui.c" "rs41.c" "ft8.c" "wspr.c"
+        "main.c" "sdr.c" "dsp.c" "aprs.c" "audio.c" "ui.c" "rs41.c" "ft8.c" "wspr.c"
         "wifi_net.c" "psk.c" "bandplan.c" "lora_aprs.c" "horus.c" "horus_decoder.c"
         "horus_v3.c"
         "horuslib/fsk.c" "horuslib/kiss_fft.c" "horuslib/kiss_fftr.c"

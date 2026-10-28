@@ -38,6 +38,7 @@
 #include "psk.h"
 #include "bandplan.h"
 #include "lora_aprs.h"
+#include "aprs.h"
 /* Stream pause/resume API implemented in sdr.c. */
 extern bool sdr_stream_pause(void);
 extern bool sdr_stream_resume(void);
@@ -282,6 +283,7 @@ static uint16_t mode_color(int m)
     case DSP_MODE_FT8:  return RGB565(60, 220, 200);
     case DSP_MODE_WSPR: return RGB565(240, 170, 80);
     case DSP_MODE_HORUS: return RGB565(140, 220, 120);
+    case DSP_MODE_APRS: return RGB565(90, 220, 245);
     default:           return COL_ACCENT; /* WFM */
     }
 }
@@ -514,6 +516,26 @@ static void draw_wspr_panel(void)
     }
 }
 
+static void draw_aprs_panel(void)
+{
+    rect(0, SPEC_Y0, LW, WF_Y0 + WF_H - SPEC_Y0, COL_BG);
+    char b[150];
+    snprintf(b, sizeof b, "APRS AFSK1200  %.3f MHZ", s_center / 1e6);
+    text(8, SPEC_Y0 + 4, 2, COL_ACCENT, b);
+    snprintf(b, sizeof b, "OK %lu  CRC ERR %lu  FLAGS %lu  AFSK %d%%", (unsigned long)aprs_packet_count(),
+             (unsigned long)aprs_crc_errors(), (unsigned long)aprs_flags(), aprs_quality_pct());
+    text(8, SPEC_Y0 + 26, 1, COL_LINE, b);
+    aprs_packet_t pk[APRS_HISTORY];
+    int n = aprs_packets(pk, APRS_HISTORY);
+    if (!n) { text(8, SPEC_Y0 + 55, 2, COL_TEXT, "WAITING FOR APRS PACKET..."); return; }
+    for (int i = 0; i < n; ++i) {
+        char line[101];
+        snprintf(line, sizeof line, "%.100s", pk[i].text);
+        line[100] = 0;
+        text(8, SPEC_Y0 + 46 + i * 22, 1, i ? COL_TEXT : COL_ACCENT, line);
+    }
+}
+
 static void draw_lora_panel(void)
 {
     rect(0, SPEC_Y0, LW, WF_Y0 + WF_H - SPEC_Y0, COL_BG);
@@ -543,6 +565,7 @@ static void draw_lora_panel(void)
 static void draw_spectrum(const float *spec, int bins)
 {
     if (lora_aprs_enabled()) { draw_lora_panel(); return; }
+    if (s_mode == DSP_MODE_APRS) { draw_aprs_panel(); return; }
     const bool rs = is_panel_mode(s_mode); /* mode with a text panel instead of the waterfall */
     if (!rs)
         memmove(LBUF + (size_t)(WF_Y0 + 1) * LW, LBUF + (size_t)WF_Y0 * LW,
@@ -638,8 +661,9 @@ static const box_t B_HF   = {  6, 272, 64, 44};
 static const box_t B_VHF  = { 74, 272, 64, 44};
 static const box_t B_UHF  = {142, 272, 64, 44};
 static const box_t B_PSK  = {210, 272, 72, 44}; /* PSK Reporter upload checkbox */
-static const box_t B_HORUS = {286, 272, 78, 44};
-static const box_t B_LORA = {368, 272, 80, 44};
+static const box_t B_HORUS = {286, 272, 50, 44};
+static const box_t B_LORA = {339, 272, 54, 44};
+static const box_t B_APRS = {396, 272, 52, 44};
 /* Mode row: WFM NFM AM USB LSB CW FT8 WSPR — 8 buttons, 52 px wide, 3 px gap (RS41 has its own
  * button). The row ends at x = 443; VOL/SQL start at x = 454. */
 static const uint8_t MODE_ROW[] = {DSP_MODE_WFM, DSP_MODE_NFM, DSP_MODE_AM, DSP_MODE_USB, DSP_MODE_LSB, DSP_MODE_CW, DSP_MODE_FT8, DSP_MODE_WSPR};
@@ -726,6 +750,7 @@ static void draw_controls(void)
 }
     draw_box(&B_HORUS, "HORUS", 1, (s_mode == DSP_MODE_HORUS) ? COL_BTN_HI : COL_BTN);
     draw_box(&B_LORA, "L-APRS", 1, lora_aprs_enabled() ? RGB565(24,110,70) : COL_BTN);
+    draw_box(&B_APRS, "APRS", 1, (s_mode == DSP_MODE_APRS) ? RGB565(24,110,70) : COL_BTN);
 
     char v[8];
     text(530, 212, 2, COL_TEXT, "VOL");
@@ -869,6 +894,11 @@ static void mode_button(int m)
         s_step_i = 2; /* 1 kHz */
         /* sondes live at 400-406 MHz; jump there if we're elsewhere */
         if (s_center < 400000000u || s_center > 406000000u) retune(403000000);
+    } else if (m == DSP_MODE_APRS) {
+        set_rate(288000);
+        s_step_i = 2;
+        retune(144800000u);
+        s_label = "APRS 1200 VHF";
     } else if (m == DSP_MODE_HORUS) {
         set_rate(1152000);
         s_step_i = 2;
@@ -1269,6 +1299,16 @@ static bool handle_touch(void)
         } else if (hit(&B_HORUS, lx, ly)) {
             mode_button(DSP_MODE_HORUS);
             changed = true;
+        } else if (hit(&B_APRS, lx, ly)) {
+            if (s_mode == DSP_MODE_APRS) {
+                uint32_t f = s_center == 144800000u ? 432500000u : 144800000u;
+                retune(f);
+                aprs_reset();
+                s_label = f == 144800000u ? "APRS 1200 VHF" : "APRS 1200 UHF";
+            } else mode_button(DSP_MODE_APRS);
+            s_panel_mode = -1;
+            s_ui_force_spectrum = true;
+            changed = true;
         } else if (hit(&B_LORA, lx, ly)) {
             if (!lora_aprs_enabled()) {
                 /* Keep the USB host/async task alive. The IQ callback discards
@@ -1362,11 +1402,12 @@ static void ui_task(void *arg)
     int last_psk = -1;
     TickType_t last_temp_tick = xTaskGetTickCount();
     uint32_t last_lora_revision = 0;
+    uint32_t last_aprs_revision = 0;
     scr_off_kick(); /* the splash counts as activity */
     while (1) {
         bool dirty = handle_touch();
         /* Do not let an active FT8/WSPR schedule override manual HORUS reception. */
-        if (!lora_aprs_enabled() && s_mode != DSP_MODE_HORUS && bandplan_tick()) dirty = true;
+        if (!lora_aprs_enabled() && s_mode != DSP_MODE_HORUS && s_mode != DSP_MODE_APRS && bandplan_tick()) dirty = true;
         /* screensaver: idle timeout turns the backlight off; a touch wakes it */
         if (!s_scr_off && SCR_OFF_MS[s_scr_off_i] &&
             pdTICKS_TO_MS(xTaskGetTickCount()) - s_last_touch_ms >= SCR_OFF_MS[s_scr_off_i])
@@ -1387,6 +1428,8 @@ static void ui_task(void *arg)
         if (ps != last_psk) { last_psk = ps; dirty = true; }
         uint32_t lr = lora_aprs_revision();
         if (lr != last_lora_revision) { last_lora_revision = lr; dirty = true; }
+        uint32_t ar = aprs_revision();
+        if (ar != last_aprs_revision) { last_aprs_revision = ar; dirty = true; }
         if (s_ui_force_spectrum) { last = NULL; s_ui_force_spectrum = false; }
         const float *spec = dsp_spectrum();
         bool newspec = spec && spec != last;
@@ -1399,7 +1442,9 @@ static void ui_task(void *arg)
             draw_spectrum(spec, bins);
             if (++meter_div >= 4) { meter_div = 0; draw_header(); }
         }
-        if (dirty) { draw_controls(); if (!lora_aprs_enabled()) draw_header(); else {
+        if (dirty) {
+            if (s_mode == DSP_MODE_APRS && !lora_aprs_enabled()) draw_aprs_panel();
+            draw_controls(); if (!lora_aprs_enabled()) draw_header(); else {
             rect(0, 0, LW, SPEC_Y0 - 1, COL_BG);
             text(8, 8, 2, COL_ACCENT, "LORA APRS");
             text(350, 14, 1, COL_LINE, "RTL-SDR PAUSED");

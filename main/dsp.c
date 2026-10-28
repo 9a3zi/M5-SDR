@@ -42,6 +42,7 @@
 #include "horus.h"
 #include "horus_decoder.h"
 #include "lora_aprs.h"
+#include "aprs.h"
 
 static const char *TAG = "dsp";
 
@@ -548,7 +549,7 @@ static void demod_bb(void)
         nif++;
 
         float out = 0;
-        if (mode == DSP_MODE_RS41 || mode == DSP_MODE_HORUS) {
+        if (mode == DSP_MODE_RS41 || mode == DSP_MODE_HORUS || mode == DSP_MODE_APRS) {
             /* Horus: remove RTL2832 centre-frequency DC spur before 4FSK modem.
              * Do not alter RS41 path or the waterfall. */
             if (mode == DSP_MODE_HORUS) {
@@ -564,6 +565,7 @@ static void demod_bb(void)
             s_fm_pb = b;
             float d = atan2f(dim, dre); /* rad/sample: ±2.4 kHz dev = ±0.31 */
             if (mode == DSP_MODE_RS41) rs41_feed(d);
+            else if (mode == DSP_MODE_APRS) aprs_feed(d);
             else { horus_feed(d); horus_decoder_feed_iq(a,b); }
             s_rs_dc += 0.001f * (d - s_rs_dc);
             out = (d - s_rs_dc) * RS41_AUDIO_GAIN;
@@ -688,6 +690,11 @@ static void apply_mode(int m)
         horus_reset();
         horus_decoder_reset();
         break;
+    case DSP_MODE_APRS:
+        design_butter_lp(3, 6500.0f, BB_RATE);
+        s_bb_sgn = 1; s_bb_w0 = 0;
+        aprs_reset();
+        break;
     case DSP_MODE_RS41:
         design_butter_lp(RS41_IF_SEC, RS41_CUT_HZ, BB_RATE);
         s_bb_sgn = 1; s_bb_w0 = 0;
@@ -804,6 +811,6 @@ int dsp_get_mode(void) { return s_mode_pub; }
 
 const char *dsp_mode_name(int mode)
 {
-    static const char *const N[DSP_MODE_COUNT] = {"WFM", "NFM", "AM", "USB", "LSB", "CW", "RS41", "FT8", "WSPR", "HORUS"};
+    static const char *const N[DSP_MODE_COUNT] = {"WFM", "NFM", "AM", "USB", "LSB", "CW", "RS41", "FT8", "WSPR", "HORUS", "APRS"};
     return (mode >= 0 && mode < DSP_MODE_COUNT) ? N[mode] : "?";
 }
