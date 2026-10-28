@@ -1,0 +1,26 @@
+# ESP-IDF build output
+build/
+
+# Fetched by the IDF component manager (pinned in dependencies.lock)
+managed_components/
+
+# Generated from sdkconfig.defaults
+sdkconfig
+sdkconfig.old
+
+# Editors / tooling
+.vscode/
+.clangd
+.cache/
+
+# Python
+__pycache__/
+*.pyc
+
+.DS_Store
+
+# Local flash dumps (32MB factory image)
+backup/
+
+# Machine-specific IDF env helper (hardcoded serial port)
+idfenv.sh
