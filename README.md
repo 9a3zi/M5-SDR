@@ -188,7 +188,7 @@ This project is based on the original project: hardparking/tab5-sdr
 This repository contains additional modifications and features developed by 9a3zi and Kimi.
 Those contributions remain subject to the applicable license terms governing the combined project.
 
-This project is licensed under the **GNU General Public License v2.0**
+This project is licensed under the **GNU General Public License v3.0**
 (see [LICENSE](LICENSE)), as required by librtlsdr.
 
 - **[librtlsdr](https://github.com/steve-m/librtlsdr)** — Steve Markgraf,
