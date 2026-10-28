@@ -44,6 +44,8 @@ Requires **ESP-IDF v5.4+** (developed on v5.4.4).
 idf.py set-target esp32p4    # first time only
 idf.py build
 idf.py -p /dev/ttyACM0 flash monitor
+or
+idf.py flash
 ```
 
 The IDF component manager fetches `esp-dsp`, the LCD/touch/codec drivers, etc.
