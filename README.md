@@ -155,35 +155,6 @@ panel then shows serial/frame number but `POSITION ENCRYPTED`. Temperature /
 humidity / pressure are not decoded (they need the per-sonde calibration that
 is spread over many frames).
 
-## Architecture
-
-The same P4 runs four cooperating pieces:
-
-```
-RTL-SDR ──USB-A host──► librtlsdr ──► IQ ring (PSRAM)
-                          (libusb shim over esp-idf usb_host)
-                                         │
-   [core 1] iq_proc: FM demod ──► audio ring ──► [core 1] ES8388 / I2S speaker
-            + FFT snapshot ──► spectrum buffer
-                                         │
-   [core 0] ui: spectrum + waterfall + controls → 640×360 buffer
-            ──► PPA (scale ×2, rotate 90°) ──► 720×1280 panel
-```
-
-| Module | Role |
-|--------|------|
-| `main/sdr.c`   | librtlsdr device + async IQ stream → PSRAM ring buffer |
-| `main/dsp.c`   | WFM/NFM demod → audio; windowed FFT → spectrum; squelch |
-| `main/audio.c` | ES8388 speaker output (esp_codec_dev) via a StreamBuffer |
-| `main/ui.c`    | landscape touch UI; PPA-rotated rendering |
-| `main/wspr.c`, `main/ft8.c` | WSPR and FT8 decoders (FT8 protocol code in `main/ft8lib/`) |
-| `main/bookmarks.h` | HF / VHF / UHF band presets (mode, sample rate, step) |
-| `components/bsp/` | M5Stack Tab5 board support (panel, touch, I/O, audio, USB power) |
-| `components/librtlsdr/` | librtlsdr ported onto the ESP-IDF USB host stack |
-
-Rendering runs at half resolution (640×360) and uses the P4 **PPA** to rotate/scale
-onto the portrait panel — full-res rotation costs ~46 ms/frame, half-res is ~4×
-cheaper.
 
 ## Credits & license
 
@@ -191,8 +162,38 @@ This project is based on the original project: hardparking/tab5-sdr
 This repository contains additional modifications and features developed by 9a3zi and Kimi.
 Those contributions remain subject to the applicable license terms governing the combined project.
 
-This project is licensed under the **GNU General Public License v3.0**
-(see [LICENSE](LICENSE)), as required by librtlsdr.
+## Third-Party Libraries and Licenses
+
+M5-SDR is developed using ESP-IDF and incorporates several open-source libraries for software-defined radio, digital signal processing, and digital mode decoding.
+
+The following third-party components retain their respective copyrights and license terms.
+
+| Component | License | Authors / Project |
+|---|---|---|
+| Horus FSK, Golay and modem components (`horuslib`) | LGPL-2.1 | David Rowe, Tomas Härdin and contributors |
+| FT8 library (`ft8lib/ft8`) | MIT | Kārlis Goba — [ft8_lib](https://github.com/kgoba/ft8_lib) |
+| KISS FFT (`ft8lib/fft`, `horuslib/kiss_fft`) | BSD-3-Clause | Mark Borgerding |
+| ASN.1 runtime (`horusbinaryv3`) | BSD-style license notices | Lev Walkin — asn1c |
+| Horus Binary v3 generated ASN.1 structures | License verification pending | Project Horus / HorusBinary |
+
+### Horus Binary
+
+M5-SDR supports Horus Binary telemetry decoding using both project-specific code and third-party decoding components.
+The Horus modem and error-correction components include code originating from the Codec2/FreeDV ecosystem.
+Horus Binary protocol documentation and reference implementations are available from:
+
+- [Project Horus – HorusDemodLib](https://github.com/projecthorus/horusdemodlib)
+- [Project Horus – HorusBinary](https://github.com/projecthorus/horusbinary)
+
+Special thanks to David Rowe, Mark Jessop (VK5QI), and the Project Horus contributors.
+
+### License Notices
+
+The third-party libraries remain subject to their original licenses.
+Copyright notices and license texts are retained in the corresponding source directories and accompanying license files.
+
+The license applicable to M5-SDR's original source code is separate from the licenses of its third-party components, subject to any applicable license compatibility and distribution requirements.
+
 
 - **[librtlsdr](https://github.com/steve-m/librtlsdr)** — Steve Markgraf,
   Dimitri Stolnikov, et al. (GPL-2.0+). The ESP-IDF USB-host port in
