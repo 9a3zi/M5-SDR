@@ -309,8 +309,9 @@ the upstream project should be verified before assigning a license to the combin
 
 ## Third-party software and licensing
 
-M5-SDR incorporates third-party source code and libraries. Their licenses **do not become MIT merely because M5-SDR's 
-original contributions may use MIT**. Preserve the original copyright notices and applicable license texts.
+This project is licensed under the **GNU General Public License v3.0 **
+
+M5-SDR incorporates third-party source code and libraries. 
 
 | Component | Location / use | License information to retain or verify |
 | --- | --- | --- |
