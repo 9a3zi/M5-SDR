@@ -27,7 +27,7 @@ strength, and firmware version. Features described here reflect the project impl
 | **WSPR** | Decodes propagation beacons; shows callsign, locator and transmit power | 14.0956 MHz (20 m), plus other amateur bands |
 | **RS41** | Decodes supported Vaisala radiosonde telemetry | 400–406 MHz |
 | **HORUS** | Horus Binary v1, v2 and v3 telemetry decoding | Tune to the balloon's transmit frequency |
-| **LoRa APRS** | Receives LoRa APRS using an external RA-02 module | According to the configured LoRa APRS channel | automatic scan sonde band |
+| **LoRa APRS** | Receives LoRa APRS using an external RA-02 module | According to the configured LoRa APRS channel | automatic scan sonde band | recording data to sd card |
 | **APRS (AFSK1200)** | Bell 202 / AX.25 packet decoding with packet history and CRC diagnostics | 144.800 MHz / 432.500 MHz presets |
 
 ### Display and automation
