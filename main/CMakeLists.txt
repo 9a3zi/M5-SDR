@@ -1,7 +1,7 @@
 idf_component_register(
     SRCS
-        "main.c" "sdr.c" "dsp.c" "aprs.c" "audio.c" "ui.c" "rs41.c" "ft8.c" "wspr.c"
-        "wifi_net.c" "psk.c" "bandplan.c" "lora_aprs.c" "horus.c" "horus_decoder.c"
+        "main.c" "sdr.c" "dsp.c" "aprs.c" "audio.c" "ui.c" "rs41.c" "rs41_log.c" "ft8.c" "wspr.c"
+        "wifi_net.c" "station_settings.c" "psk.c" "bandplan.c" "lora_aprs.c" "horus.c" "horus_decoder.c"
         "horus_v3.c"
         "horuslib/fsk.c" "horuslib/kiss_fft.c" "horuslib/kiss_fftr.c"
         "horuslib/mpdecode_core.c" "horuslib/H_256_768_22.c" "horuslib/H_128_384_23.c"
@@ -54,7 +54,7 @@ idf_component_register(
     INCLUDE_DIRS "." "ft8lib" "horusbinaryv3"
     REQUIRES bsp librtlsdr usb esp_timer esp_driver_ppa espressif__esp-dsp
              esp_driver_spi esp_driver_gpio esp_wifi espressif__esp_wifi_remote
-             esp_netif esp_event nvs_flash lwip
+             esp_netif esp_event nvs_flash lwip fatfs sdmmc
 )
 
 # The ASN.1 headers are also included by horus_v3.c, so the macro must be

@@ -21,6 +21,7 @@
 #include "nvs_flash.h"
 #include "esp_sntp.h"
 #include "net_cfg.h"
+#include "station_settings.h"
 
 static const char *TAG = "wifi";
 
@@ -43,6 +44,8 @@ static void net_evt(void *arg, esp_event_base_t base, int32_t id, void *data)
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         s_time_ok = false;
+        xEventGroupClearBits(s_ev, EV_GOT_IP);
+        snprintf(s_ip, sizeof s_ip, "0.0.0.0");
         ESP_LOGW(TAG, "disconnected, retrying…");
         esp_wifi_connect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
@@ -78,14 +81,16 @@ void wifi_net_init(void)
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &net_evt, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &net_evt, NULL));
 
+    station_settings_t st;
+    station_settings_get(&st);
     wifi_config_t wc = {0};
-    strncpy((char *)wc.sta.ssid, NET_WIFI_SSID, sizeof(wc.sta.ssid) - 1);
-    strncpy((char *)wc.sta.password, NET_WIFI_PASSWORD, sizeof(wc.sta.password) - 1);
-    wc.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK; /* open networks: use WIFI_AUTH_OPEN */
+    strncpy((char *)wc.sta.ssid, st.ssid, sizeof(wc.sta.ssid) - 1);
+    strncpy((char *)wc.sta.password, st.password, sizeof(wc.sta.password) - 1);
+    wc.sta.threshold.authmode = st.password[0] ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
     ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_LOGI(TAG, "connecting to '%s'…", NET_WIFI_SSID);
+    ESP_LOGI(TAG, "connecting to '%s'…", st.ssid);
 }
 
 bool wifi_net_connected(void)
@@ -102,4 +107,18 @@ bool wifi_net_time_ok(void)
 const char *wifi_net_ip(void)
 {
     return s_ip;
+}
+
+void wifi_net_apply_settings(void)
+{
+    station_settings_t st;
+    station_settings_get(&st);
+    wifi_config_t wc = {0};
+    strncpy((char *)wc.sta.ssid, st.ssid, sizeof(wc.sta.ssid)-1);
+    strncpy((char *)wc.sta.password, st.password, sizeof(wc.sta.password)-1);
+    wc.sta.threshold.authmode = st.password[0] ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+    esp_wifi_disconnect();
+    esp_err_t e = esp_wifi_set_config(WIFI_IF_STA, &wc);
+    if (e == ESP_OK) e = esp_wifi_connect();
+    ESP_LOGI(TAG, "new WiFi settings for '%s': %s", st.ssid, esp_err_to_name(e));
 }

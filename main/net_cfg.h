@@ -10,8 +10,8 @@
 #define NET_CFG_H
 
 /* ---- WiFi (station) ------------------------------------------------------ */
-#define NET_WIFI_SSID     "UR-SSID"
-#define NET_WIFI_PASSWORD "UR-PSWD"
+#define NET_WIFI_SSID     "WIFI-SSID"
+#define NET_WIFI_PASSWORD "WIFI-PASS"
 
 /* Timezone for the band-plan scheduler (POSIX TZ string; SNTP syncs UTC and
  * this converts it to local time for the schedule). Central European Time
@@ -20,9 +20,9 @@
 
 /* ---- PSK Reporter identity ------------------------------------------------ */
 /* Your callsign as the receiving station (uploaded with every report). */
-#define PSK_CALLSIGN      "CALLSIGN"
+#define PSK_CALLSIGN      "HAM-CALLLSIGN"
 /* Your locator, 4 or 6 characters (e.g. "JN76", "FN42AB"). */
-#define PSK_GRID          "LOCATOR"
+#define PSK_GRID          "HAM-QTH-LOC"
 /* Software descriptor shown on pskreporter.info. */
 #define PSK_SW_NAME       "M5-SDR v1.3"
 /* Receiver rig description (optional rigInformation field, 30351.13). */

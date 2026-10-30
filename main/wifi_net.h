@@ -12,6 +12,7 @@
  * and SNTP (pool.ntp.org) once an IP is obtained. Call once after ui_start().
  * Never fails fatally — without WiFi the receiver keeps working. */
 void wifi_net_init(void);
+void wifi_net_apply_settings(void);
 
 bool wifi_net_connected(void); /* has an IP address */
 bool wifi_net_time_ok(void);   /* SNTP has set the clock (needed for reports) */

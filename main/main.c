@@ -26,6 +26,7 @@
 #include "wifi_net.h"
 #include "psk.h"
 #include "lora_aprs.h"
+#include "rs41_log.h"
 
 static const char *TAG = "tab5-sdr";
 
@@ -90,6 +91,8 @@ void app_main(void)
     }));
     bsp_tab5_display_set_brightness(80);
     draw_test_pattern();
+
+    rs41_log_start(); /* Optional SD; failure does not stop SDR reception. */
 
     /* USB-A 5V VBUS is off by default — power the dongle, then enumerate. */
     bsp_tab5_set_usb_host_power(true);

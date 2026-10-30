@@ -18,12 +18,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
+#include <errno.h>
+#include <strings.h>
+#include <sys/stat.h>
+#include "rs41_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "station_settings.h"
+#include "wifi_net.h"
 #include "driver/ppa.h"
 #include "driver/temperature_sensor.h"
 
@@ -97,7 +104,8 @@ static void cpu_temp_sample(void)
 #define FREQ_MAX 1766000000u
 
 /* Drag tuning: full canvas width ≈ 100 MHz (fast band scanning). */
-#define DRAG_HZ_PER_PX (100000000 / LW)
+#define DRAG_HZ_PER_PX (10000000 / LW)
+#define ZOOM_MIN_HZ 10000u /* visual zoom only; DSP sample rate is unchanged */
 
 #define SQ_OFFSET 64.0f
 #define SQ_STEP   5
@@ -125,6 +133,7 @@ static ppa_client_handle_t s_ppa;
 static int s_fb_index;
 
 static uint32_t s_center;
+static uint32_t s_view_span; /* 0 means full DSP spectrum width */
 static int s_volume = AUDIO_VOL_DEFAULT;
 static int s_squelch = -60;
 static int s_mode = DSP_MODE_WFM;
@@ -206,6 +215,39 @@ static const uint8_t *glyph(char c)
         {0x02,0x04,0x08,0x10,0x08,0x04,0x02}, /* <  (43) */
         {0x08,0x04,0x02,0x01,0x02,0x04,0x08}, /* >  (44) */
     };
+    static const uint8_t lowercase[26][7] = {
+        {0x00,0x0E,0x01,0x0F,0x11,0x0F,0x00},
+        {0x00,0x10,0x10,0x1E,0x11,0x1E,0x00},
+        {0x00,0x00,0x0E,0x10,0x10,0x0E,0x00},
+        {0x00,0x01,0x01,0x0F,0x11,0x0F,0x00},
+        {0x00,0x00,0x0E,0x1F,0x10,0x0E,0x00},
+        {0x00,0x06,0x08,0x1C,0x08,0x08,0x00},
+        {0x00,0x00,0x0F,0x11,0x0F,0x01,0x00},
+        {0x00,0x10,0x10,0x1E,0x11,0x11,0x00},
+        {0x00,0x04,0x00,0x0C,0x04,0x0E,0x00},
+        {0x00,0x02,0x00,0x02,0x12,0x0C,0x00},
+        {0x00,0x10,0x12,0x14,0x18,0x16,0x00},
+        {0x00,0x0C,0x04,0x04,0x04,0x0E,0x00},
+        {0x00,0x00,0x1A,0x15,0x15,0x15,0x00},
+        {0x00,0x00,0x1E,0x11,0x11,0x11,0x00},
+        {0x00,0x00,0x0E,0x11,0x11,0x0E,0x00},
+        {0x00,0x00,0x1E,0x11,0x1E,0x10,0x00},
+        {0x00,0x00,0x0F,0x11,0x0F,0x01,0x00},
+        {0x00,0x00,0x16,0x18,0x10,0x10,0x00},
+        {0x00,0x00,0x0F,0x18,0x03,0x1E,0x00},
+        {0x00,0x08,0x1C,0x08,0x08,0x06,0x00},
+        {0x00,0x00,0x11,0x11,0x13,0x0D,0x00},
+        {0x00,0x00,0x11,0x11,0x0A,0x04,0x00},
+        {0x00,0x00,0x11,0x15,0x15,0x0A,0x00},
+        {0x00,0x00,0x11,0x0A,0x04,0x1B,0x00},
+        {0x00,0x00,0x11,0x11,0x0F,0x01,0x00},
+        {0x00,0x00,0x1F,0x02,0x04,0x1F,0x00}
+    };
+    static const uint8_t underscore[7] = {0,0,0,0,0,0,0x1F};
+    static const uint8_t at_sign[7] = {0x0E,0x11,0x17,0x15,0x17,0x10,0x0E};
+    if (c >= 'a' && c <= 'z') return lowercase[c - 'a'];
+    if (c == '_') return underscore;
+    if (c == '@') return at_sign;
     switch (c) {
     case '0' ... '9': return G[c - '0'];
     case 'M': return G[10];  case 'H': return G[11];  case 'z': return G[12];
@@ -303,6 +345,31 @@ static void draw_cpu_temp(void)
     text(541, 29, 1, color, b);
 }
 
+static uint32_t view_span_hz(void);
+
+/* RS41 auto scanner. Run entirely in the UI task; the RS41 decoder and
+ * SD logger keep running in their existing tasks. */
+typedef enum { RS_SCAN_OFF, RS_SCAN_SWEEP, RS_SCAN_VERIFY, RS_SCAN_LOCKED } rs_scan_state_t;
+static rs_scan_state_t s_rs_scan = RS_SCAN_OFF;
+static uint32_t s_rs_scan_since;
+static uint32_t s_rs_scan_last_frame;
+static uint32_t s_rs_scan_seq;
+static int s_rs_scan_step;
+static const char *rs_scan_status(void)
+{
+    switch (s_rs_scan) {
+    case RS_SCAN_SWEEP: return "RS41 SCANNING";
+    case RS_SCAN_VERIFY: return "RS41 VERIFY";
+    case RS_SCAN_LOCKED: return "RS41 LOCKED";
+    default: return "MANUAL";
+    }
+}
+static void rs_scan_stop(void)
+{
+    if (s_rs_scan != RS_SCAN_OFF) ESP_LOGI("rs41_scan", "Stopped");
+    s_rs_scan = RS_SCAN_OFF;
+    if (s_mode == DSP_MODE_RS41) s_label = "RS41 MANUAL";
+}
 static void draw_header(void)
 {
     rect(0, 0, LW, SPEC_Y0 - 1, COL_BG);
@@ -321,7 +388,16 @@ static void draw_header(void)
 
     /* mode + bookmark label, top-left */
     text(6, 4, 2, mode_color(s_mode), dsp_mode_name(s_mode));
-    text(6, 24, 1, COL_TEXT, s_label);
+    /* Zoom span beside the active mode, outside the waterfall. */
+    uint32_t visible = view_span_hz();
+    char span_label[32];
+    if (visible >= 1000000)
+        snprintf(span_label, sizeof span_label, "SPAN %.2fM", visible / 1e6);
+    else
+        snprintf(span_label, sizeof span_label, "SPAN %luK", (unsigned long)(visible / 1000));
+    text(100, 7, 1, COL_TEXT, span_label);
+    text(6, 24, 1, s_rs_scan == RS_SCAN_LOCKED ? COL_LINE : COL_TEXT,
+         s_rs_scan == RS_SCAN_OFF ? s_label : rs_scan_status());
 
     /* S-meter top-right, -60..+60 relative scale */
     int mx = 470, my = 6, mw = 160, mh = 11;
@@ -367,6 +443,8 @@ static void draw_rs41_panel(void)
     s_panel_mode = -1; /* this panel overwrites the shared area */
     rect(0, WF_Y0, LW, WF_H, RGB565(0, 0, 0));
 
+    rect(540, WF_Y0 + 3, 92, 23, RGB565(30, 90, 110));
+    text(555, WF_Y0 + 8, 2, COL_TEXT, "LOG");
     const int x = 8, pitch = 18;
     int y = WF_Y0 + 4;
     char b[128];
@@ -562,6 +640,13 @@ static void draw_lora_panel(void)
     }
 }
 
+static uint32_t view_span_hz(void)
+{
+    uint32_t full = dsp_span_hz();
+    if (!s_view_span || s_view_span > full) s_view_span = full;
+    return s_view_span;
+}
+
 static void draw_spectrum(const float *spec, int bins)
 {
     if (lora_aprs_enabled()) { draw_lora_panel(); return; }
@@ -571,8 +656,13 @@ static void draw_spectrum(const float *spec, int bins)
         memmove(LBUF + (size_t)(WF_Y0 + 1) * LW, LBUF + (size_t)WF_Y0 * LW,
                 (size_t)(WF_H - 1) * LW * sizeof(uint16_t));
     int cx = LW / 2;
+    uint32_t full = dsp_span_hz(), visible = view_span_hz();
+    int shown_bins = (int)((uint64_t)bins * visible / full);
+    if (shown_bins < 2) shown_bins = 2;
+    int start_bin = (bins - shown_bins) / 2;
     for (int x = 0; x < LW; x++) {
-        int bin = (x * bins) / LW;
+        int bin = start_bin + (int)((int64_t)x * shown_bins / LW);
+        if (bin >= bins) bin = bins - 1;
         float tt = (spec[bin] - DB_MIN) / (DB_MAX - DB_MIN);
         if (!rs) LBUF[(size_t)WF_Y0 * LW + x] = heat(tt);
         int h = (int)(SPEC_H * (tt < 0 ? 0 : tt > 1 ? 1 : tt));
@@ -857,6 +947,95 @@ static void snap_to_peak(void)
     retune((int64_t)s_center + off);
 }
 
+/* Sweep in overlapping 1 MHz FFT windows. Find a peak, retune it to the
+ * discriminator centre, then demand a CRC-valid RS41 frame before locking.
+ * Avoid interpreting old decoder data as a new lock by comparing seq values. */
+static void rs_scan_next(uint32_t now)
+{
+    const uint32_t first = 400500000u;
+    const uint32_t step = 900000u;
+    uint32_t f = first + (uint32_t)s_rs_scan_step * step;
+    if (f > 405500000u) { s_rs_scan_step = 0; f = first; }
+    s_rs_scan_step++;
+    retune(f);
+    rs41_reset();
+    s_rs_scan_since = now;
+    s_rs_scan = RS_SCAN_SWEEP;
+    ESP_LOGI("rs41_scan", "Sweep %.3f MHz", f / 1e6);
+}
+static void mode_button(int m);
+static void rs_scan_start(void)
+{
+    if (lora_aprs_enabled()) return;
+    if (s_mode != DSP_MODE_RS41) mode_button(DSP_MODE_RS41);
+    s_view_span = 0;
+    s_rs_scan_step = 0;
+    rs41_info_t r;
+    s_rs_scan_seq = rs41_get_info(&r) ? r.seq : 0;
+    rs_scan_next(pdTICKS_TO_MS(xTaskGetTickCount()));
+    ESP_LOGI("rs41_scan", "Auto scan 400-406 MHz started");
+}
+static bool rs_scan_tick(void)
+{
+    if (s_rs_scan == RS_SCAN_OFF) return false;
+    if (s_mode != DSP_MODE_RS41 || lora_aprs_enabled()) {
+        rs_scan_stop(); return true;
+    }
+    uint32_t now = pdTICKS_TO_MS(xTaskGetTickCount());
+    rs41_info_t r;
+    if (rs41_get_info(&r) && r.seq != s_rs_scan_seq) {
+        s_rs_scan_seq = r.seq;
+        if (r.have_id && r.blk_ok) {
+            if (s_rs_scan != RS_SCAN_LOCKED) ESP_LOGI("rs41_scan", "LOCK %s @ %.3f MHz", r.id, s_center / 1e6);
+            s_rs_scan = RS_SCAN_LOCKED;
+            s_rs_scan_last_frame = now;
+            return true;
+        }
+    }
+    if (s_rs_scan == RS_SCAN_LOCKED) {
+        if (now - s_rs_scan_last_frame >= 60000u) {
+            ESP_LOGI("rs41_scan", "No valid frame for 60s, resuming");
+            rs_scan_next(now);
+            return true;
+        }
+        return false;
+    }
+    if (s_rs_scan == RS_SCAN_VERIFY) {
+        if (now - s_rs_scan_since >= 4500u) {
+            rs_scan_next(now);
+            return true;
+        }
+        return false;
+    }
+    /* Allow FFT to settle after each tune; inspect at ~1.2 seconds. */
+    if (now - s_rs_scan_since < 1200u) return false;
+    const float *spec = dsp_spectrum();
+    int bins = dsp_spectrum_bins();
+    if (spec && bins > 64) {
+        double avg = 0;
+        for (int i = 0; i < bins; i++) avg += spec[i];
+        avg /= bins;
+        int peak = -1;
+        float max = (float)avg + 13.0f;
+        for (int i = bins / 10; i < bins * 9 / 10; i++) {
+            if (abs(i - bins / 2) < 10) continue; /* RTL DC spike */
+            if (spec[i] > max) { max = spec[i]; peak = i; }
+        }
+        if (peak >= 0) {
+            int64_t offset = (int64_t)llround((peak - bins / 2) *
+                                                  ((double)dsp_span_hz() / bins));
+            retune((int64_t)s_center + offset);
+            rs41_reset();
+            s_rs_scan = RS_SCAN_VERIFY;
+            s_rs_scan_since = now;
+            ESP_LOGI("rs41_scan", "Candidate %.3f MHz, checking RS41 CRC", s_center / 1e6);
+            return true;
+        }
+    }
+    rs_scan_next(now);
+    return true;
+}
+
 static void set_mode(int mode)
 {
     if (mode < 0 || mode >= DSP_MODE_COUNT) mode = DSP_MODE_WFM;
@@ -885,21 +1064,25 @@ static void plan_apply(int mode, uint32_t freq)
 /* A mode button was pressed: select the mode and its sensible defaults. */
 static void mode_button(int m)
 {
+    if (m != DSP_MODE_RS41) rs_scan_stop();
     const bool again = (s_mode == m); /* same mode pressed twice */
     set_mode(m);
     s_label = "MANUAL";
     /* sensible default step: 100 Hz for SSB/CW (SSB needs ~50 Hz accuracy), 25 kHz otherwise */
     if (m == DSP_MODE_RS41) {
+        s_view_span = 0; /* Reset zoom on RS41 selection. */
         set_rate(1152000); /* need the full 1.15 MHz view to find the sonde */
         s_step_i = 2; /* 1 kHz */
         /* sondes live at 400-406 MHz; jump there if we're elsewhere */
         if (s_center < 400000000u || s_center > 406000000u) retune(403000000);
     } else if (m == DSP_MODE_APRS) {
+        s_view_span = 0; /* Reset zoom on APRS selection. */
         set_rate(288000);
         s_step_i = 2;
         retune(144800000u);
         s_label = "APRS 1200 VHF";
     } else if (m == DSP_MODE_HORUS) {
+        s_view_span = 0; /* Reset zoom on HORUS selection. */
         set_rate(1152000);
         s_step_i = 2;
         /* Always force the user's Horus V1 frequency on button press.
@@ -962,6 +1145,10 @@ static void select_bookmark(const bookmark_t *b);
 
 static void band_press(int band, const bookmark_t *list, int n, int *cursor, const char *last_label)
 {
+    rs_scan_stop();
+    /* Restore the full waterfall/spectrum width whenever a band button is pressed.
+     * Set to zero so view_span_hz() adopts the DSP span after set_rate(). */
+    s_view_span = 0;
     if (band_of(s_center) == band) { /* already in this band: next preset */
         *cursor = (*cursor + 1) % n;
         select_bookmark(&list[*cursor]);
@@ -1046,13 +1233,147 @@ static void scr_off_set(bool off)
  * open it owns the whole screen and all touches; the normal controls are
  * unreachable until it is closed. */
 
+static void menu_close(void);
 static int s_menu;
+/* RS41 archive: menu 3=file list, 4=CSV contents. Only the UI task reads files. */
+#define RS41_LOG_PAGE 8
+#define RS41_LOG_MAX 128
+static char s_log_names[RS41_LOG_MAX][64];
+static int s_log_count, s_log_page, s_log_selected, s_log_lines_page;
+static int s_log_dir_errno;
+static void rs41_log_refresh(void)
+{
+    s_log_count = 0;
+    s_log_dir_errno = 0;
+    DIR *d = opendir("/sdcard/RS41");
+    if (!d) {
+        s_log_dir_errno = errno;
+        ESP_LOGE("rs41_ui", "Cannot open /sdcard/RS41: errno=%d", errno);
+        return;
+    }
+    struct dirent *e;
+    while ((e = readdir(d)) && s_log_count < RS41_LOG_MAX) {
+        const char *name = e->d_name;
+        size_t n = strlen(name);
+        ESP_LOGI("rs41_ui", "SD entry: '%s' (len=%u)", name, (unsigned)n);
+        if (n < 5) continue;
+        /* FAT directory entries can have an upper-case extension. */
+        if (strcasecmp(name + n - 4, ".csv") != 0) continue;
+        if (n >= sizeof(s_log_names[0])) continue;
+        snprintf(s_log_names[s_log_count++], sizeof(s_log_names[0]),
+                 "%.*s", (int)sizeof(s_log_names[0]) - 1, name);
+    }
+    closedir(d);
+    ESP_LOGI("rs41_ui", "RS41 CSV files found: %d", s_log_count);
+    for (int i = 1; i < s_log_count; i++) {
+        char tmp[64]; strcpy(tmp, s_log_names[i]);
+        int j = i;
+        while (j > 0 && strcmp(s_log_names[j-1], tmp) > 0) {
+            strcpy(s_log_names[j], s_log_names[j-1]); j--;
+        }
+        strcpy(s_log_names[j], tmp);
+    }
+    if (s_log_page * RS41_LOG_PAGE >= s_log_count) s_log_page = 0;
+}
+static void rs41_log_draw(void)
+{
+    rect(0, 0, LW, LH, RGB565(10, 14, 30));
+    text(12, 8, 2, COL_ACCENT, s_menu == 3 ? "RS41 SD LOGS" : "RS41 CSV VIEW");
+    rect(534, 4, 96, 31, COL_BTN);
+    text(551, 12, 2, COL_TEXT, "BACK");
+    if (!rs41_log_ready()) {
+        text(20, 75, 2, COL_TEXT, "SD CARD NOT MOUNTED");
+        return;
+    }
+    if (s_menu == 3) {
+        char msg[80];
+        snprintf(msg, sizeof(msg), "FILES %d  PAGE %d/%d", s_log_count, s_log_page+1,
+                 s_log_count ? (s_log_count+RS41_LOG_PAGE-1)/RS41_LOG_PAGE : 1);
+        text(12, 43, 1, COL_LINE, msg);
+        if (!s_log_count) {
+            if (s_log_dir_errno) {
+                text(24, 100, 2, COL_TEXT, "SD DIRECTORY ERROR");
+                char eb[40];
+                snprintf(eb, sizeof eb, "errno=%d", s_log_dir_errno);
+                text(24, 123, 1, COL_TEXT, eb);
+            } else {
+                text(24, 100, 2, COL_TEXT, "NO RS41 CSV FILES YET");
+            }
+        }
+        for (int i = 0; i < RS41_LOG_PAGE; i++) {
+            int idx = s_log_page * RS41_LOG_PAGE + i;
+            if (idx >= s_log_count) break;
+            int y = 64 + i * 31;
+            rect(14, y, 610, 28, RGB565(28, 45, 67));
+            text(25, y+7, 2, COL_TEXT, s_log_names[idx]);
+            char path[112]; struct stat st;
+            snprintf(path, sizeof path, "/sdcard/RS41/%s", s_log_names[idx]);
+            if (stat(path, &st) == 0) {
+                char sz[40]; snprintf(sz, sizeof sz, "%lu B", (unsigned long)st.st_size);
+                text(522, y+10, 1, COL_LINE, sz);
+            }
+        }
+    } else {
+        if (s_log_selected < 0 || s_log_selected >= s_log_count) return;
+        text(12, 43, 2, COL_LINE, s_log_names[s_log_selected]);
+        char path[112]; snprintf(path, sizeof path, "/sdcard/RS41/%s", s_log_names[s_log_selected]);
+        FILE *f = fopen(path, "r");
+        if (!f) { text(20, 100, 2, COL_TEXT, "CANNOT OPEN FILE"); return; }
+        char line[256]; int row = 0, skip = s_log_lines_page * 10;
+        /* Skip header, then page through CSV records. */
+        fgets(line, sizeof line, f);
+        while (skip-- > 0 && fgets(line, sizeof line, f)) {}
+        while (row < 10 && fgets(line, sizeof line, f)) {
+            char out[96];
+            /* Show first fields: serial, frame, frequency and GPS week. */
+            snprintf(out, sizeof out, "%.72s", line);
+            out[strcspn(out, "\r\n")] = 0;
+            text(12, 72 + row*23, 1, COL_TEXT, out);
+            row++;
+        }
+        fclose(f);
+        if (!row) text(20, 105, 2, COL_TEXT, "NO MORE RECORDS");
+        char pg[40]; snprintf(pg, sizeof pg, "RECORDS %d-%d", s_log_lines_page*10+1, s_log_lines_page*10+row);
+        text(14, 43+247, 1, COL_LINE, pg);
+    }
+    rect(12, 313, 150, 36, COL_BTN); text(29, 323, 2, COL_TEXT, "< PREV");
+    rect(477, 313, 150, 36, COL_BTN); text(499, 323, 2, COL_TEXT, "NEXT >");
+}
+static bool rs41_log_touch(int x, int y)
+{
+    if (y < 40 && x > 520) {
+        if (s_menu == 4) { s_menu = 3; rs41_log_refresh(); }
+        else menu_close();
+        return true;
+    }
+    if (y >= 310) {
+        int delta = x < 175 ? -1 : x > 460 ? 1 : 0;
+        if (s_menu == 3) {
+            int maxpage = s_log_count ? (s_log_count-1)/RS41_LOG_PAGE : 0;
+            s_log_page += delta;
+            if (s_log_page < 0) s_log_page = 0;
+            if (s_log_page > maxpage) s_log_page = maxpage;
+        } else {
+            s_log_lines_page += delta;
+            if (s_log_lines_page < 0) s_log_lines_page = 0;
+        }
+        return true;
+    }
+    if (s_menu == 3 && y >= 64 && y < 64+RS41_LOG_PAGE*31) {
+        int idx = s_log_page * RS41_LOG_PAGE + (y-64)/31;
+        if (idx < s_log_count) { s_log_selected = idx; s_log_lines_page = 0; s_menu = 4; }
+        return true;
+    }
+    return false;
+}
 
-/* Plan list rows: 4 plans + EDIT USER PLAN + SCREEN OFF + CLOSE. */
-#define M1_ROWS      7
+
+/* PLAN menu: OFF, USER PLAN, EDIT USER PLAN, SCREEN OFF, SETTINGS, CLOSE. */
+#define M1_ROWS      6
+static const int s_plan_menu_actions[M1_ROWS] = {BP_OFF, BP_USER, -1, -2, -3, -4};
 #define M1_ROW_Y0    48
-#define M1_ROW_PITCH 36
-#define M1_ROW_H     30
+#define M1_ROW_PITCH 32
+#define M1_ROW_H     28
 #define M1_ROW_X     16
 #define M1_ROW_W     608
 
@@ -1066,6 +1387,114 @@ static int s_menu;
 #define E_BAND_X    250
 #define E_DEL_X     560
 
+/* SETTINGS editor: menu 5 = fields, 6 = touch keyboard. */
+static station_settings_t s_st_edit;
+static int s_st_field;
+static bool s_st_lower;
+static bool s_st_saved;
+static char *settings_field(void)
+{
+    switch (s_st_field) {
+    case 0: return s_st_edit.ssid;
+    case 1: return s_st_edit.password;
+    case 2: return s_st_edit.callsign;
+    default: return s_st_edit.grid;
+    }
+}
+static size_t settings_capacity(void)
+{
+    switch (s_st_field) {
+    case 0: return sizeof s_st_edit.ssid;
+    case 1: return sizeof s_st_edit.password;
+    case 2: return sizeof s_st_edit.callsign;
+    default: return sizeof s_st_edit.grid;
+    }
+}
+static void settings_draw(void)
+{
+    rect(0,0,LW,LH,RGB565(10,14,30));
+    if (s_menu == 5) {
+        text(12,8,2,COL_ACCENT,"STATION SETTINGS");
+        text(12,32,1,COL_TEXT,"TAP FIELD TO EDIT - SAVE WRITES FLASH NVS");
+        const char *labels[4] = {"WIFI SSID","WIFI PASSWORD","CALLSIGN","QTH LOCATOR"};
+        const char *values[4] = {s_st_edit.ssid,"********",s_st_edit.callsign,s_st_edit.grid};
+        for (int i=0;i<4;i++) {
+            int y=58+i*48;
+            rect(12,y,616,42,COL_BTN);
+            text(22,y+6,2,COL_TEXT,labels[i]);
+            text(290,y+6,2,RGB565(130,230,255),values[i]);
+        }
+        rect(12,264,294,44,RGB565(25,100,65));
+        text(95,276,2,COL_TEXT,"SAVE");
+        rect(334,264,294,44,COL_BTN);
+        text(424,276,2,COL_TEXT,"BACK");
+        if (s_st_saved) text(14,314,1,RGB565(150,255,160),"SAVED - WIFI RECONNECTING");
+        return;
+    }
+    const char *labels[4]={"WIFI SSID","WIFI PASSWORD","CALLSIGN","QTH LOCATOR"};
+    text(12,6,2,COL_ACCENT,labels[s_st_field]);
+    char shown[72];
+    const char *v=settings_field();
+    if (s_st_field == 1) {
+        size_t n=strlen(v); if(n>60)n=60;
+        memset(shown,'*',n); shown[n]=0;
+    } else snprintf(shown,sizeof shown,"%s",v);
+    rect(12,36,616,44,COL_BTN);
+    text(20,48,2,COL_TEXT,shown);
+    const char *keys[4]={"1234567890","QWERTYUIOP","ASDFGHJKL-","ZXCVBNM._@"};
+    for(int row=0;row<4;row++) for(int col=0;col<10;col++) {
+        char ch=keys[row][col]; if(!ch)continue;
+        int x=12+col*62,y=90+row*43;
+        rect(x,y,58,39,COL_BTN);
+        char label[2]={ch,0};
+        /* Keep keyboard labels in the original legible uppercase font.
+           CASE still controls the character inserted into the field. */
+        text(x+19,y+10,2,COL_TEXT,label);
+    }
+    const char *special[5]={"CASE","SPACE","DEL","OK","CANCEL"};
+    for(int i=0;i<5;i++) {
+        int x=12+i*124;
+        rect(x,268,120,43,i==0 && !s_st_lower ? RGB565(25,140,65) : (i==3 ? RGB565(25,100,65) : COL_BTN));
+        text(x+12,281,2,COL_TEXT,special[i]);
+    }
+}
+static bool settings_touch(int x,int y)
+{
+    if(s_menu==5) {
+        if(y>=58 && y<250) {int i=(y-58)/48; if(i<4){s_st_field=i;s_st_lower=(i<=1);s_menu=6;}return true;}
+        if(y>=264 && y<310) {
+            if(x<318) {
+                s_st_saved=station_settings_save(&s_st_edit);
+                if(s_st_saved)wifi_net_apply_settings();
+            } else {s_menu=1;}
+            return true;
+        }
+        return true;
+    }
+    if(y>=90 && y<262) {
+        int row=(y-90)/43,col=(x-12)/62;
+        if(x>=12 && col>=0 && col<10 && row<4) {
+            const char *keys[4]={"1234567890","QWERTYUIOP","ASDFGHJKL-","ZXCVBNM._@"};
+            char ch=keys[row][col];
+            if(ch) {
+                if(s_st_lower && ch>='A' && ch<='Z')ch+=32;
+                char *v=settings_field();size_t n=strlen(v);
+                if(n+1<settings_capacity()){v[n]=ch;v[n+1]=0;}
+            }
+        }
+        return true;
+    }
+    if(y>=268 && y<314 && x>=12) {
+        int i=(x-12)/124;
+        char *v=settings_field();size_t n=strlen(v);
+        if(i==0)s_st_lower=!s_st_lower;
+        if(i==1 && n+1<settings_capacity()){v[n]=' ';v[n+1]=0;}
+        if(i==2 && n)v[n-1]=0;
+        if(i==3 || i==4)s_menu=5;
+        return true;
+    }
+    return true;
+}
 static void menu_close(void)
 {
     s_menu = 0;
@@ -1120,22 +1549,26 @@ static void draw_menu(void)
         menu_status(b, sizeof b);
         text(6, 26, 1, COL_TEXT, b);
         for (int i = 0; i < M1_ROWS; i++) {
+            int action = s_plan_menu_actions[i];
             box_t r = {M1_ROW_X, M1_ROW_Y0 + i * M1_ROW_PITCH, M1_ROW_W, M1_ROW_H};
-            bool sel = (i < 4) && bandplan_active() == i;
+            bool sel = action >= 0 && bandplan_active() == action;
             rect(r.x, r.y, r.w, r.h, sel ? RGB565(30, 110, 75) : COL_BTN);
             rect(r.x, r.y, r.w, 2, COL_BTN_HI);
-            text(r.x + 12, r.y + 8, 2, COL_TEXT,
-                 (i < 4) ? bandplan_name(i) : (i == 4 ? "EDIT USER PLAN" : (i == 5 ? "SCREEN OFF" : "CLOSE")));
-            if (i < 4) {
-                plan_info(i, b, sizeof b);
+            const char *label = action >= 0 ? bandplan_name(action) :
+                (action == -1 ? "EDIT USER PLAN" : action == -2 ? "SCREEN OFF" :
+                 action == -3 ? "SETTINGS" : "CLOSE");
+            text(r.x + 12, r.y + 8, 2, COL_TEXT, label);
+            if (action >= 0) {
+                plan_info(action, b, sizeof b);
                 text(r.x + 300, r.y + 11, 1, RGB565(170, 180, 200), b);
-            } else if (i == 5) { /* screensaver delay; tap to cycle */
+            } else if (action == -2) {
                 text(r.x + 300, r.y + 11, 1, s_scr_off_i ? RGB565(190, 255, 210) : RGB565(170, 180, 200),
                      SCR_OFF_LBL[s_scr_off_i]);
             }
         }
         return;
     }
+    if (s_menu == 5 || s_menu == 6) { settings_draw(); return; }
     /* USER-plan editor */
     text(6, 4, 2, COL_ACCENT, "EDIT USER PLAN");
     text(6, 26, 1, COL_TEXT, "TAP HOUR MODE OR BAND TO CHANGE    X = DELETE");
@@ -1163,13 +1596,17 @@ static void draw_menu(void)
 
 static bool menu_touch(int x, int y)
 {
+    if (s_menu == 5 || s_menu == 6) return settings_touch(x,y);
+    if (s_menu == 3 || s_menu == 4) return rs41_log_touch(x, y);
     if (s_menu == 1) {
         for (int i = 0; i < M1_ROWS; i++) {
             box_t r = {M1_ROW_X, M1_ROW_Y0 + i * M1_ROW_PITCH, M1_ROW_W, M1_ROW_H};
             if (hit(&r, x, y)) {
-                if (i < 4) { bandplan_select(i); menu_close(); }
-                else if (i == 4) s_menu = 2;
-                else if (i == 5) { s_scr_off_i = (s_scr_off_i + 1) % N_SCR_OFF; scr_off_save(); }
+                int action = s_plan_menu_actions[i];
+                if (action >= 0) { bandplan_select(action); menu_close(); }
+                else if (action == -1) s_menu = 2;
+                else if (action == -2) { s_scr_off_i = (s_scr_off_i + 1) % N_SCR_OFF; scr_off_save(); }
+                else if (action == -3) { station_settings_get(&s_st_edit); s_st_saved=false; s_menu=5; }
                 else menu_close();
                 return true;
             }
@@ -1213,14 +1650,19 @@ static bool handle_touch(void)
 {
     static bool prev = false, dragging = false;
     static int drag_x0, tap_y;
+    static bool multi_gesture = false;
+    static float pinch_start_dist = 0;
+    static uint32_t pinch_start_span = 0;
     static bool tap_moved;
+    static bool rs_hold = false, rs_hold_handled = false;
+    static uint32_t rs_hold_since = 0;
     static uint32_t drag_f0;
     static int grace = 0;    /* ignore touches briefly after boot */
     static int run = 0;      /* consecutive raw-pressed samples (debounce) */
     bool changed = false;
 
-    esp_lcd_touch_point_data_t p;
-    int n = bsp_tab5_touch_read(&p, 1);
+    esp_lcd_touch_point_data_t p[2];
+    int n = bsp_tab5_touch_read(p, 2);
 
     /* ~1.2 s startup grace: the touch controller reports stray points right after
      * init that would otherwise "tap" a control. */
@@ -1230,6 +1672,7 @@ static bool handle_touch(void)
      * rejecting single-sample glitches. */
     run = (n > 0) ? run + 1 : 0;
     bool pressed = run >= 2;
+    bool two = pressed && n >= 2;
 
     if (s_scr_off) { /* screensaver: the touch only wakes the display */
         if (pressed) { scr_off_set(false); scr_off_kick(); }
@@ -1240,14 +1683,41 @@ static bool handle_touch(void)
 
     int lx = 0, ly = 0;
     if (pressed) {
-        lx = (PANEL_H - p.y) / SCALE;
-        ly = p.x / SCALE;
+        lx = (PANEL_H - p[0].y) / SCALE;
+        ly = p[0].x / SCALE;
         if (lx < 0) lx = 0;
         if (lx >= LW) lx = LW - 1;
         if (ly < 0) ly = 0;
         if (ly >= LH) ly = LH - 1;
     }
     bool edge = pressed && !prev;
+    /* Defer the RS41 short press until finger release so a long press cannot
+     * trigger the old SNAP action first. */
+    bool on_rs = pressed && hit(&B_RS41, lx, ly);
+    if (edge && on_rs && !s_menu) {
+        rs_hold = true;
+        rs_hold_handled = false;
+        rs_hold_since = pdTICKS_TO_MS(xTaskGetTickCount());
+    }
+    if (rs_hold && pressed && !rs_hold_handled && on_rs &&
+        pdTICKS_TO_MS(xTaskGetTickCount()) - rs_hold_since >= 1500u) {
+        if (s_rs_scan == RS_SCAN_OFF) rs_scan_start(); else rs_scan_stop();
+        rs_hold_handled = true;
+        prev = pressed;
+        return true;
+    }
+    if (rs_hold && !pressed) {
+        if (!rs_hold_handled) {
+            if (s_rs_scan != RS_SCAN_OFF) rs_scan_stop();
+            if (s_mode == DSP_MODE_RS41) { snap_to_peak(); s_label = "SNAP"; }
+            else mode_button(DSP_MODE_RS41);
+        }
+        rs_hold = false;
+        dragging = false;
+        prev = pressed;
+        return true;
+    }
+    if (rs_hold) { prev = pressed; return false; }
 
     if (s_menu) { /* an open menu owns the screen and all touches */
         if (edge) changed = menu_touch(lx, ly);
@@ -1255,19 +1725,70 @@ static bool handle_touch(void)
         return changed;
     }
 
+    /* Two fingers on the spectrum/waterfall: zoom around the tuned centre.
+     * This changes ONLY the displayed FFT window, never the SDR sample rate. */
+    if (two && !lora_aprs_enabled()) {
+        int x2 = (PANEL_H - p[1].y) / SCALE;
+        int y2 = p[1].x / SCALE;
+        if (ly < CTRL_Y0 && y2 < CTRL_Y0) {
+            float dx = (float)(x2 - lx), dy = (float)(y2 - ly);
+            float dist = sqrtf(dx * dx + dy * dy);
+            if (!multi_gesture) {
+                multi_gesture = true;
+                pinch_start_dist = dist;
+                pinch_start_span = view_span_hz();
+            } else if (pinch_start_dist > 12 && dist > 12) {
+                double target = (double)pinch_start_span * pinch_start_dist / dist;
+                uint32_t full = dsp_span_hz();
+                if (target < ZOOM_MIN_HZ) target = ZOOM_MIN_HZ;
+                if (target > full) target = full;
+                uint32_t z = (uint32_t)target;
+                if (z != s_view_span) { s_view_span = z; changed = true; }
+            }
+            dragging = false;
+            tap_moved = true;
+            prev = pressed;
+            return changed;
+        }
+    }
+    if (multi_gesture) {
+        /* Wait until both fingers lift; don't interpret the remaining finger as a tap. */
+        if (!pressed) multi_gesture = false;
+        dragging = false;
+        prev = pressed;
+        return changed;
+    }
+
+    /* LOG is inside the waterfall area: handle its tap before drag tuning. */
+    if (edge && s_mode == DSP_MODE_RS41 && !lora_aprs_enabled() &&
+        lx >= 540 && lx < 632 && ly >= WF_Y0 + 3 && ly < WF_Y0 + 26) {
+        dragging = false;
+        tap_moved = false;
+        s_log_page = 0;
+        rs41_log_refresh();
+        s_menu = 3;
+        prev = pressed;
+        return true;
+    }
+
     if (pressed && ly < CTRL_Y0 && !lora_aprs_enabled()) {
         /* drag the spectrum/waterfall to scan */
         if (edge) { dragging = true; drag_x0 = lx; drag_f0 = s_center; tap_moved = false; tap_y = ly; }
         else if (dragging) {
             if (lx - drag_x0 > 6 || drag_x0 - lx > 6) tap_moved = true;
-            int64_t df = -(int64_t)(lx - drag_x0) * DRAG_HZ_PER_PX;
-            retune((int64_t)drag_f0 + df);
-            s_label = "MANUAL";
-            changed = true;
+            if (tap_moved) {
+                int64_t df = -(int64_t)(lx - drag_x0) * DRAG_HZ_PER_PX;
+                rs_scan_stop();
+                retune((int64_t)drag_f0 + df);
+                s_label = "MANUAL";
+                changed = true;
+            }
         }
     } else if (edge) {
         dragging = false;
-        if (lora_aprs_enabled() && !hit(&B_LORA, lx, ly)) { /* LoRa owns the receiver. */ }
+        if (s_mode == DSP_MODE_RS41 && lx >= 540 && ly >= WF_Y0 + 3 && ly < WF_Y0 + 29) {
+            s_log_page = 0; rs41_log_refresh(); s_menu = 3; changed = true;
+        } else if (lora_aprs_enabled() && !hit(&B_LORA, lx, ly)) { /* LoRa owns the receiver. */ }
         else if (hit(&B_TDN, lx, ly)) { retune((int64_t)s_center - STEPS[s_step_i]); changed = true; }
         else if (hit(&B_TUP, lx, ly)) { retune((int64_t)s_center + STEPS[s_step_i]); changed = true; }
         else if (hit(&B_STEP, lx, ly)) { s_step_i = (s_step_i + 1) % N_STEPS; changed = true; }
@@ -1276,9 +1797,7 @@ static bool handle_touch(void)
             sdr_set_gain(GAINS[s_gain_i]);
             changed = true;
         } else if (hit(&B_RS41, lx, ly)) {
-            if (s_mode == DSP_MODE_RS41) { snap_to_peak(); s_label = "SNAP"; } /* second press: centre on the peak */
-            else mode_button(DSP_MODE_RS41);
-            changed = true;
+            /* RS41 is handled on release or after a 1.5s hold above. */
         } else if (ly >= MODE_BTN_Y && ly < MODE_BTN_Y + MODE_BTN_H) {
             for (int i = 0; i < N_MODE_ROW; i++) {
                 box_t b = { MODE_BTN_X(i), MODE_BTN_Y, MODE_BTN_W, MODE_BTN_H };
@@ -1300,6 +1819,7 @@ static bool handle_touch(void)
             mode_button(DSP_MODE_HORUS);
             changed = true;
         } else if (hit(&B_APRS, lx, ly)) {
+            s_view_span = 0; /* Reset also when toggling APRS VHF/UHF. */
             if (s_mode == DSP_MODE_APRS) {
                 uint32_t f = s_center == 144800000u ? 432500000u : 144800000u;
                 retune(f);
@@ -1310,6 +1830,7 @@ static bool handle_touch(void)
             s_ui_force_spectrum = true;
             changed = true;
         } else if (hit(&B_LORA, lx, ly)) {
+            s_view_span = 0; /* Reset on LoRa APRS entry/exit. */
             if (!lora_aprs_enabled()) {
                 /* Keep the USB host/async task alive. The IQ callback discards
                  * samples during LoRa mode; DSP stops processing them. */
@@ -1353,8 +1874,18 @@ static bool handle_touch(void)
     }
 
     if (!pressed) {
-        /* a tap (no movement) on the WSPR text panel runs the decoder self-test */
-        if (dragging && !tap_moved && s_mode == DSP_MODE_WSPR && tap_y >= WF_Y0) { wspr_selftest(); changed = true; }
+        /* Preserve WSPR panel self-test; otherwise a tap tunes to that FFT position. */
+        if (dragging && !tap_moved) {
+            if (s_mode == DSP_MODE_WSPR && tap_y >= WF_Y0) {
+                wspr_selftest(); changed = true;
+            } else if (s_mode != DSP_MODE_APRS &&
+                       (tap_y < WF_Y0 || !is_panel_mode(s_mode))) {
+                int64_t offset = ((int64_t)drag_x0 - LW / 2) * view_span_hz() / LW;
+                retune((int64_t)drag_f0 + offset);
+                s_label = "TAP TUNE";
+                changed = true;
+            }
+        }
         dragging = false;
     }
     prev = pressed;
@@ -1406,15 +1937,16 @@ static void ui_task(void *arg)
     scr_off_kick(); /* the splash counts as activity */
     while (1) {
         bool dirty = handle_touch();
+        if (rs_scan_tick()) dirty = true;
         /* Do not let an active FT8/WSPR schedule override manual HORUS reception. */
-        if (!lora_aprs_enabled() && s_mode != DSP_MODE_HORUS && s_mode != DSP_MODE_APRS && bandplan_tick()) dirty = true;
+        if (!lora_aprs_enabled() && s_mode != DSP_MODE_HORUS && s_mode != DSP_MODE_APRS && s_rs_scan == RS_SCAN_OFF && bandplan_tick()) dirty = true;
         /* screensaver: idle timeout turns the backlight off; a touch wakes it */
         if (!s_scr_off && SCR_OFF_MS[s_scr_off_i] &&
             pdTICKS_TO_MS(xTaskGetTickCount()) - s_last_touch_ms >= SCR_OFF_MS[s_scr_off_i])
             scr_off_set(true);
         if (s_scr_off) { vTaskDelay(pdMS_TO_TICKS(50)); continue; } /* dark: nothing to render */
         if (s_menu) { /* an open menu owns the screen; the SDR keeps running underneath */
-            if (dirty) { draw_menu(); present(); }
+            if (dirty) { if (s_menu == 3 || s_menu == 4) rs41_log_draw(); else draw_menu(); present(); }
             vTaskDelay(pdMS_TO_TICKS(30));
             continue;
         }
