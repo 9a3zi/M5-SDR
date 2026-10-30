@@ -20,9 +20,9 @@
 
 /* ---- PSK Reporter identity ------------------------------------------------ */
 /* Your callsign as the receiving station (uploaded with every report). */
-#define PSK_CALLSIGN      "HAM-CALLLSIGN"
+#define PSK_CALLSIGN      "CALLSIGN"
 /* Your locator, 4 or 6 characters (e.g. "JN76", "FN42AB"). */
-#define PSK_GRID          "HAM-QTH-LOC"
+#define PSK_GRID          "QTHLOC"
 /* Software descriptor shown on pskreporter.info. */
 #define PSK_SW_NAME       "M5-SDR v1.3"
 /* Receiver rig description (optional rigInformation field, 30351.13). */
