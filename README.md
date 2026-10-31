@@ -92,6 +92,7 @@ versions are recorded in `dependencies.lock`.
 - **Remembered settings:** switching away from a band and returning restores its last frequency, mode, tuning step and sample rate. 
     Pressing the currently selected band button jumps to that band's start frequency.
 - **Custom presets:** edit `main/bookmarks.h` to add or adjust entries.
+- **Direct frequency enter 
 
 Default band entry points described by the current project:
 
