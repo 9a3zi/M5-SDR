@@ -138,7 +138,7 @@ static int s_volume = AUDIO_VOL_DEFAULT;
 static int s_squelch = -60;
 static int s_mode = DSP_MODE_WFM;
 static const char *s_label = "WFM broadcast";
-static int s_bm_hf = 0, s_bm_vhf = 0, s_bm_uhf = 0; /* per-band preset cursor */
+static int s_bm_hf = -1, s_bm_vhf = 0, s_bm_uhf = 0; /* per-band preset cursor */
 static uint32_t s_rate_cur = 1152000; /* RTL2832 sample rate currently selected */
 
 /* Tuning step (Hz) applied by the [-]/[+] buttons; STEP button cycles it. */
@@ -1369,8 +1369,8 @@ static bool rs41_log_touch(int x, int y)
 
 
 /* PLAN menu: OFF, USER PLAN, EDIT USER PLAN, SCREEN OFF, SETTINGS, CLOSE. */
-#define M1_ROWS      6
-static const int s_plan_menu_actions[M1_ROWS] = {BP_OFF, BP_USER, -1, -2, -3, -4};
+#define M1_ROWS      7
+static const int s_plan_menu_actions[M1_ROWS] = {BP_OFF, BP_USER, -1, -2, -3, -5, -4};
 #define M1_ROW_Y0    48
 #define M1_ROW_PITCH 32
 #define M1_ROW_H     28
@@ -1495,6 +1495,75 @@ static bool settings_touch(int x,int y)
     }
     return true;
 }
+
+/* Generic LoRa RX screen (7), numeric keypad (8). APRS profile is separate. */
+static lora_rx_config_t s_lr_edit;
+static int s_lr_field;
+static char s_lr_input[20];
+static bool s_lr_saved;
+static void lr_draw(void) {
+    rect(0,0,LW,LH,RGB565(10,14,30));
+    char b[128];
+    if(s_menu==8) {
+        const char *names[]={"FREQUENCY MHZ","SF (7-12)","BW KHZ","SYNC WORD HEX"};
+        text(12,8,2,COL_ACCENT,names[s_lr_field]);
+        rect(12,40,616,45,COL_BTN);text(22,51,2,COL_TEXT,s_lr_input);
+        const char *rows[]={"123","456","789",".0X"};
+        for(int r=0;r<4;r++)for(int c=0;c<3;c++){
+            int x=12+c*154,y=96+r*47;rect(x,y,148,42,COL_BTN);
+            char ch[2]={rows[r][c],0};text(x+60,y+10,2,COL_TEXT,ch);
+        }
+        rect(476,96,152,90,COL_BTN);text(505,126,2,COL_TEXT,"DEL");
+        rect(476,192,152,90,RGB565(25,100,65));text(510,222,2,COL_TEXT,"OK");
+        rect(12,292,616,32,COL_BTN);text(280,300,2,COL_TEXT,"BACK");
+        return;
+    }
+    text(12,5,2,COL_ACCENT,"LORA RX - LIVE PACKETS");
+    snprintf(b,sizeof b,"FREQ %.3f MHz   SF%u   BW %.2f kHz   SW 0x%02X",s_lr_edit.freq_hz/1000000.0,(unsigned)s_lr_edit.sf,s_lr_edit.bw_hz/1000.0,(unsigned)s_lr_edit.sync_word);
+    text(12,29,1,COL_TEXT,b);
+    const char *names[]={"FREQ","SF","BW","SYNC"};
+    for(int i=0;i<4;i++){int x=12+i*156;rect(x,49,150,35,COL_BTN);text(x+18,58,2,COL_TEXT,names[i]);}
+    snprintf(b,sizeof b,"PACKETS: %lu",(unsigned long)lora_aprs_packet_count());text(12,92,1,COL_ACCENT,b);
+    lora_aprs_packet_t pk[LORA_APRS_HISTORY];int n=lora_aprs_packets(pk,LORA_APRS_HISTORY);
+    for(int i=0;i<n;i++){
+        int y=110+i*34;
+        snprintf(b,sizeof b,"SNR %.1f  %.60s",(double)pk[i].snr_db,pk[i].text);
+        b[76]=0;text(12,y,1,COL_TEXT,b);
+    }
+    rect(12,288,298,40,RGB565(25,100,65));text(100,298,2,COL_TEXT,"SAVE");
+    rect(330,288,298,40,COL_BTN);text(420,298,2,COL_TEXT,"BACK");
+    if(s_lr_saved)text(12,273,1,RGB565(150,255,160),"SAVED TO NVS");
+}
+static bool lr_touch(int x,int y){
+    if(s_menu==7){
+        if(y>=49 && y<87){int i=(x-12)/156;if(x>=12 && i>=0 && i<4){
+            s_lr_field=i;
+            if(i==0)snprintf(s_lr_input,sizeof s_lr_input,"%.3f",s_lr_edit.freq_hz/1000000.0);
+            if(i==1)snprintf(s_lr_input,sizeof s_lr_input,"%u",(unsigned)s_lr_edit.sf);
+            if(i==2)snprintf(s_lr_input,sizeof s_lr_input,"%.2f",s_lr_edit.bw_hz/1000.0);
+            if(i==3)snprintf(s_lr_input,sizeof s_lr_input,"%02X",(unsigned)s_lr_edit.sync_word);
+            s_menu=8;
+        }return true;}
+        if(y>=288){
+            if(x<320){s_lr_saved=lora_rx_save_config(&s_lr_edit);}
+            else {lora_rx_enable(false);sdr_set_iq_discard(false);audio_set_volume(s_volume);menu_close();}
+            return true;
+        }
+        return true;
+    }
+    if(y>=292){s_menu=7;return true;}
+    if(x>=476 && y>=96 && y<186){size_t n=strlen(s_lr_input);if(n)s_lr_input[n-1]=0;return true;}
+    if(x>=476 && y>=192 && y<282){
+        char *end=NULL;
+        if(s_lr_field==0){double v=strtod(s_lr_input,&end);if(end!=s_lr_input && !*end && v>=400 && v<=525)s_lr_edit.freq_hz=(uint32_t)(v*1000000+0.5);}
+        if(s_lr_field==1){long v=strtol(s_lr_input,&end,10);if(end!=s_lr_input && !*end && v>=7 && v<=12)s_lr_edit.sf=(uint8_t)v;}
+        if(s_lr_field==2){double v=strtod(s_lr_input,&end);const uint32_t widths[]={7800,10400,15600,20800,31250,41700,62500,125000,250000,500000};for(int i=0;i<10;i++)if(fabs(v*1000-widths[i])<80)s_lr_edit.bw_hz=widths[i];}
+        if(s_lr_field==3){const char *t=s_lr_input;if(t[0]=='0' && (t[1]=='x'||t[1]=='X'))t+=2;unsigned long v=strtoul(t,&end,16);if(end!=t && !*end && v<=255)s_lr_edit.sync_word=(uint8_t)v;}
+        s_lr_saved=false;s_menu=7;return true;
+    }
+    if(y>=96 && y<284 && x>=12 && x<470){int r=(y-96)/47,c=(x-12)/154;if(r<4 && c<3){const char *rows[]={"123","456","789",".0X"};char ch=rows[r][c];size_t n=strlen(s_lr_input);if(n+1<sizeof s_lr_input){s_lr_input[n]=ch;s_lr_input[n+1]=0;}}return true;}
+    return true;
+}
 static void menu_close(void)
 {
     s_menu = 0;
@@ -1540,6 +1609,67 @@ static void plan_info(int plan, char *b, size_t n)
     }
 }
 
+static void menu_close(void);
+/* Direct frequency entry from the large frequency display. */
+static char s_freq_entry[20];
+static void freq_entry_draw(void)
+{
+    rect(0, 0, LW, LH, RGB565(10, 14, 30));
+    text(12, 8, 2, COL_ACCENT, "ENTER FREQUENCY (MHz)");
+    rect(12, 40, 616, 44, COL_BTN);
+    text(24, 49, 3, COL_TEXT, s_freq_entry[0] ? s_freq_entry : "_");
+    static const char *keys[12] = {
+        "1", "2", "3", "4", "5", "6", "7", "8", "9", ".", "0", "DEL"
+    };
+    for (int i = 0; i < 12; ++i) {
+        int x = 12 + (i % 3) * 208, y = 94 + (i / 3) * 48;
+        rect(x, y, 198, 42, COL_BTN);
+        text(x + 76, y + 10, 2, COL_TEXT, keys[i]);
+    }
+    rect(12, 294, 298, 50, COL_BTN);
+    text(105, 308, 2, COL_TEXT, "CANCEL");
+    rect(330, 294, 298, 50, RGB565(25, 100, 65));
+    text(439, 308, 2, COL_TEXT, "TUNE");
+}
+static bool freq_entry_touch(int x, int y)
+{
+    if (y >= 294) {
+        if (x >= 320 && s_freq_entry[0]) {
+            char *end = NULL;
+            double mhz = strtod(s_freq_entry, &end);
+            if (end != s_freq_entry && *end == '\0' && isfinite(mhz) &&
+                mhz >= (double)FREQ_MIN / 1e6 && mhz <= (double)FREQ_MAX / 1e6) {
+                rs_scan_stop();
+                retune((int64_t)llround(mhz * 1e6));
+                s_label = "MANUAL";
+            } else {
+                ESP_LOGW(TAG, "Invalid frequency: %s", s_freq_entry);
+                return true; /* keep editor open */
+            }
+        }
+        s_menu = 0;
+        menu_close();
+        return true;
+    }
+    if (y >= 94 && y < 286 && x >= 12 && x < 636) {
+        int col = (x - 12) / 208, row = (y - 94) / 48;
+        if (col >= 0 && col < 3 && row >= 0 && row < 4) {
+            static const char *keys[12] = {
+                "1", "2", "3", "4", "5", "6", "7", "8", "9", ".", "0", "DEL"
+            };
+            const char *k = keys[row * 3 + col];
+            size_t len = strlen(s_freq_entry);
+            if (row == 3 && col == 2) {
+                if (len) s_freq_entry[len - 1] = '\0';
+            } else if (len + 1 < sizeof s_freq_entry &&
+                       (*k != '.' || !strchr(s_freq_entry, '.'))) {
+                s_freq_entry[len] = *k;
+                s_freq_entry[len + 1] = '\0';
+            }
+        }
+    }
+    return true;
+}
 static void draw_menu(void)
 {
     rect(0, 0, LW, LH, RGB565(10, 14, 30));
@@ -1556,7 +1686,7 @@ static void draw_menu(void)
             rect(r.x, r.y, r.w, 2, COL_BTN_HI);
             const char *label = action >= 0 ? bandplan_name(action) :
                 (action == -1 ? "EDIT USER PLAN" : action == -2 ? "SCREEN OFF" :
-                 action == -3 ? "SETTINGS" : "CLOSE");
+                 action == -3 ? "SETTINGS" : action == -5 ? "LORA RX" : "CLOSE");
             text(r.x + 12, r.y + 8, 2, COL_TEXT, label);
             if (action >= 0) {
                 plan_info(action, b, sizeof b);
@@ -1568,7 +1698,9 @@ static void draw_menu(void)
         }
         return;
     }
+    if (s_menu == 9) { freq_entry_draw(); return; }
     if (s_menu == 5 || s_menu == 6) { settings_draw(); return; }
+    if (s_menu == 7 || s_menu == 8) { lr_draw(); return; }
     /* USER-plan editor */
     text(6, 4, 2, COL_ACCENT, "EDIT USER PLAN");
     text(6, 26, 1, COL_TEXT, "TAP HOUR MODE OR BAND TO CHANGE    X = DELETE");
@@ -1596,7 +1728,9 @@ static void draw_menu(void)
 
 static bool menu_touch(int x, int y)
 {
+    if (s_menu == 9) return freq_entry_touch(x, y);
     if (s_menu == 5 || s_menu == 6) return settings_touch(x,y);
+    if (s_menu == 7 || s_menu == 8) return lr_touch(x,y);
     if (s_menu == 3 || s_menu == 4) return rs41_log_touch(x, y);
     if (s_menu == 1) {
         for (int i = 0; i < M1_ROWS; i++) {
@@ -1607,6 +1741,12 @@ static bool menu_touch(int x, int y)
                 else if (action == -1) s_menu = 2;
                 else if (action == -2) { s_scr_off_i = (s_scr_off_i + 1) % N_SCR_OFF; scr_off_save(); }
                 else if (action == -3) { station_settings_get(&s_st_edit); s_st_saved=false; s_menu=5; }
+                else if (action == -5) {
+                    lora_rx_get_config(&s_lr_edit);s_lr_saved=false;
+                    lora_rx_enable(true);
+                    if(lora_rx_enabled()) {sdr_set_iq_discard(true);audio_set_volume(0);s_menu=7;}
+                    else {s_lora_error_until=xTaskGetTickCount()+pdMS_TO_TICKS(5000);menu_close();}
+                }
                 else menu_close();
                 return true;
             }
@@ -1759,6 +1899,15 @@ static bool handle_touch(void)
         return changed;
     }
 
+    /* Tap the large 7-segment frequency display to enter MHz directly. */
+    if (edge && !lora_aprs_enabled() && ly < SPEC_Y0 && lx >= 180 && lx < 470) {
+        snprintf(s_freq_entry, sizeof s_freq_entry, "%.4f", s_center / 1e6);
+        s_menu = 9;
+        dragging = false;
+        prev = pressed;
+        return true;
+    }
+
     /* LOG is inside the waterfall area: handle its tap before drag tuning. */
     if (edge && s_mode == DSP_MODE_RS41 && !lora_aprs_enabled() &&
         lx >= 540 && lx < 632 && ly >= WF_Y0 + 3 && ly < WF_Y0 + 26) {
@@ -1808,7 +1957,13 @@ static bool handle_touch(void)
                 }
             }
         } else if (hit(&B_HF, lx, ly)) {
-            band_press(BAND_HF, BM_HF, BM_HF_N, &s_bm_hf, "HF LAST"); changed = true;
+            /* Every HF press advances to the next amateur band, even from VHF/UHF. */
+            if (band_of(s_center) != BAND_HF) band_save();
+            s_view_span = 0;
+            rs_scan_stop();
+            s_bm_hf = (s_bm_hf + 1) % BM_HF_N;
+            select_bookmark(&BM_HF[s_bm_hf]);
+            changed = true;
         } else if (hit(&B_VHF, lx, ly)) {
             band_press(BAND_VHF, BM_VHF, BM_VHF_N, &s_bm_vhf, "VHF LAST"); changed = true;
         } else if (hit(&B_UHF, lx, ly)) {
@@ -1831,7 +1986,7 @@ static bool handle_touch(void)
             changed = true;
         } else if (hit(&B_LORA, lx, ly)) {
             s_view_span = 0; /* Reset on LoRa APRS entry/exit. */
-            if (!lora_aprs_enabled()) {
+            if (!lora_aprs_enabled() || lora_rx_enabled()) {
                 /* Keep the USB host/async task alive. The IQ callback discards
                  * samples during LoRa mode; DSP stops processing them. */
                 lora_aprs_enable(true);
@@ -1946,6 +2101,7 @@ static void ui_task(void *arg)
             scr_off_set(true);
         if (s_scr_off) { vTaskDelay(pdMS_TO_TICKS(50)); continue; } /* dark: nothing to render */
         if (s_menu) { /* an open menu owns the screen; the SDR keeps running underneath */
+            if (s_menu == 7 && lora_aprs_revision()!=last_lora_revision) {last_lora_revision=lora_aprs_revision();dirty=true;}
             if (dirty) { if (s_menu == 3 || s_menu == 4) rs41_log_draw(); else draw_menu(); present(); }
             vTaskDelay(pdMS_TO_TICKS(30));
             continue;

@@ -26,9 +26,19 @@ typedef struct {
     uint32_t step_hz;
 } bookmark_t;
 
-/* HF: start at 14.000 MHz, upper sideband (SSB convention above 10 MHz). */
+/* HF amateur bands, cycled with each press of the HF button. */
 static const bookmark_t BM_HF[] = {
-    {"HF 14 MHZ", 14000000, DSP_MODE_USB, 288000, 500},
+    {"160M 1.840",   1840000, DSP_MODE_LSB, 288000, 500},
+    {"80M 3.650",    3650000, DSP_MODE_LSB, 288000, 500},
+    {"60M 5.357",    5357000, DSP_MODE_USB, 288000, 500},
+    {"40M 7.100",    7100000, DSP_MODE_LSB, 288000, 500},
+    {"30M 10.120",  10120000, DSP_MODE_USB, 288000, 500},
+    {"20M 14.200",  14200000, DSP_MODE_USB, 288000, 500},
+    {"17M 18.100",  18100000, DSP_MODE_USB, 288000, 500},
+    {"15M 21.200",  21200000, DSP_MODE_USB, 288000, 500},
+    {"12M 24.930",  24930000, DSP_MODE_USB, 288000, 500},
+    {"10M 28.500",  28500000, DSP_MODE_USB, 288000, 500},
+    {"6M 50.150",   50150000, DSP_MODE_USB, 1152000, 500},
 };
 
 /* VHF: start at 144.000 MHz, narrowband FM. */

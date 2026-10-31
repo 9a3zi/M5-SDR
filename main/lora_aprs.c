@@ -11,6 +11,7 @@
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
+#include "nvs.h"
 
 #define PIN_SCK 5
 #define PIN_MOSI 18
@@ -41,6 +42,8 @@
 static const char *TAG = "lora_aprs";
 static spi_device_handle_t dev;
 static volatile bool active;
+static volatile bool generic_rx;
+static lora_rx_config_t rx_cfg = {434830000UL, 9, 125000UL, 0xF1};
 static volatile uint32_t revision;
 static char status_line[192] = "LoRa APRS: standby";
 static portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
@@ -89,12 +92,53 @@ void lora_aprs_status(char *out, unsigned size) {
 }
 uint32_t lora_aprs_revision(void) { return revision; }
 bool lora_aprs_enabled(void) { return active; }
+static void apply_profile(bool generic) {
+    const uint32_t freq = generic ? rx_cfg.freq_hz : LORA_FREQ_HZ;
+    const int sf = generic ? rx_cfg.sf : 12;
+    const uint32_t bw = generic ? rx_cfg.bw_hz : 125000;
+    static const uint32_t widths[] = {7800,10400,15600,20800,31250,41700,62500,125000,250000,500000};
+    int bi=7; for(int i=0;i<10;i++) if(widths[i]==bw) bi=i;
+    reg_write(REG_OPMODE,0x81);
+    uint64_t frf=((uint64_t)freq<<19)/32000000ULL;
+    reg_write(REG_FRF_MSB,(frf>>16)&255);
+    reg_write(REG_FRF_MSB+1,(frf>>8)&255);
+    reg_write(REG_FRF_MSB+2,frf&255);
+    reg_write(REG_MODEM_CONFIG1,(bi<<4)|0x02); /* CR 4/5, explicit */
+    reg_write(REG_MODEM_CONFIG2,(sf<<4)|0x04); /* CRC on */
+    reg_write(REG_MODEM_CONFIG3,0x04 | ((sf>=11 && bw<=125000)?0x08:0));
+    reg_write(REG_SYNC_WORD,generic?rx_cfg.sync_word:0x12);
+    reg_write(REG_IRQ_FLAGS,0xff);
+    reg_write(REG_OPMODE,0x85);
+}
+void lora_rx_get_config(lora_rx_config_t *out) { if(out) *out=rx_cfg; }
+static bool rx_cfg_valid(const lora_rx_config_t *c) {
+    if(!c || c->freq_hz<400000000UL || c->freq_hz>525000000UL || c->sf<7 || c->sf>12)return false;
+    static const uint32_t widths[]={7800,10400,15600,20800,31250,41700,62500,125000,250000,500000};
+    for(int i=0;i<10;i++) if(c->bw_hz==widths[i])return true;
+    return false;
+}
+bool lora_rx_save_config(const lora_rx_config_t *cfg) {
+    if(!rx_cfg_valid(cfg))return false;
+    nvs_handle_t h; if(nvs_open("lora_rx",NVS_READWRITE,&h)!=ESP_OK)return false;
+    esp_err_t e=nvs_set_blob(h,"profile",cfg,sizeof(*cfg));
+    if(e==ESP_OK)e=nvs_commit(h);
+    nvs_close(h);
+    if(e!=ESP_OK)return false;
+    rx_cfg=*cfg;
+    if(active && generic_rx)apply_profile(true);
+    publish("LoRa RX profile saved");
+    return true;
+}
+bool lora_rx_enabled(void) {return active && generic_rx;}
+void lora_rx_enable(bool enable) {
+    if(!dev){active=false;generic_rx=false;publish("LoRa RX: RA-02 not found");return;}
+    if(enable){generic_rx=true;active=true;apply_profile(true);publish("LoRa RX: listening");}
+    else {active=false;generic_rx=false;reg_write(REG_OPMODE,0x81);publish("LoRa RX: standby");}
+}
 void lora_aprs_enable(bool enable) {
-    if (!dev) { active = false; publish("LoRa APRS: RA-02 not found"); return; }
-    active = enable;
-    reg_write(REG_OPMODE, enable ? 0x85 : 0x81); /* LoRa RX continuous / standby */
-    if (enable) publish("LoRa APRS: listening 433.775 SF12 BW125");
-    else publish("LoRa APRS: standby");
+    if(!dev){active=false;generic_rx=false;publish("LoRa APRS: RA-02 not found");return;}
+    if(enable){generic_rx=false;active=true;apply_profile(false);publish("LoRa APRS: listening 433.775 SF12 BW125");}
+    else {active=false;generic_rx=false;reg_write(REG_OPMODE,0x81);publish("LoRa APRS: standby");}
 }
 static void task(void *arg) {
     (void)arg;
@@ -113,11 +157,11 @@ static void task(void *arg) {
                         uint8_t c = reg_read(REG_FIFO);
                         if (i < 3) first[i] = c;
                         /* LoRa APRS TNC payload prefix: 3C FF 01 */
-                        if (i < 3) continue;
+                        if (!generic_rx && i < 3) continue;
                         if (j + 1 < sizeof line) line[j++] = (c >= 32 && c <= 126) ? (char)c : '.';
                     }
                     line[j] = 0;
-                    if (n >= 3 && first[0] == 0x3c && first[1] == 0xff && first[2] == 0x01) {
+                    if (generic_rx || (n >= 3 && first[0] == 0x3c && first[1] == 0xff && first[2] == 0x01)) {
                         int8_t raw_snr = (int8_t)reg_read(REG_PKT_SNR_VALUE);
                         float snr = (float)raw_snr / 4.0f;
                         int rssi = -164 + (int)reg_read(REG_PKT_RSSI_VALUE);
@@ -175,6 +219,12 @@ void lora_aprs_init(void) {
     reg_write(REG_SYNC_WORD, 0x12);
     reg_write(REG_PA_CONFIG, 0x00); /* receiver only */
     reg_write(REG_IRQ_FLAGS, 0xff);
+    nvs_handle_t h;
+    if(nvs_open("lora_rx",NVS_READONLY,&h)==ESP_OK){
+        lora_rx_config_t saved;size_t len=sizeof(saved);
+        if(nvs_get_blob(h,"profile",&saved,&len)==ESP_OK && len==sizeof(saved) && rx_cfg_valid(&saved))rx_cfg=saved;
+        nvs_close(h);
+    }
     publish("LoRa APRS: SX1278 ready");
     xTaskCreate(task, "lora_aprs", 4096, NULL, 4, NULL);
 }
