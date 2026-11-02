@@ -1,4 +1,5 @@
 # M5-SDR
+![M5-SDR](images/IMG_20261102_210143(2).jpg)
 
 **Standalone RTL-SDR receiver and digital-mode decoder for the M5Stack Tab5 (ESP32-P4).**
 
