@@ -43,12 +43,14 @@ static const char *TAG = "lora_aprs";
 static spi_device_handle_t dev;
 static volatile bool active;
 static volatile bool generic_rx;
-static lora_rx_config_t rx_cfg = {434830000UL, 9, 125000UL, 0xF1};
+static lora_rx_config_t rx_cfg = {434830000UL, 9, 125000UL, 0xF1, 0};
 static volatile uint32_t revision;
 static char status_line[192] = "LoRa APRS: standby";
 static portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 static lora_aprs_packet_t packets[LORA_APRS_HISTORY];
 static uint32_t packet_count;
+static lora_aprs_packet_t rx_packets[LORA_RX_HISTORY];
+static uint32_t rx_packet_count;
 int lora_aprs_packets(lora_aprs_packet_t *out, int max_packets) {
     if (!out || max_packets <= 0) return 0;
     if (max_packets > LORA_APRS_HISTORY) max_packets = LORA_APRS_HISTORY;
@@ -62,6 +64,23 @@ int lora_aprs_packets(lora_aprs_packet_t *out, int max_packets) {
 uint32_t lora_aprs_packet_count(void) {
     portENTER_CRITICAL(&mux);
     uint32_t n = packet_count;
+    portEXIT_CRITICAL(&mux);
+    return n;
+}
+
+int lora_rx_packets(lora_aprs_packet_t *out, int max_packets) {
+    if (!out || max_packets <= 0) return 0;
+    if (max_packets > LORA_RX_HISTORY) max_packets = LORA_RX_HISTORY;
+    portENTER_CRITICAL(&mux);
+    int n = rx_packet_count < (uint32_t)max_packets ? (int)rx_packet_count : max_packets;
+    for (int i = 0; i < n; ++i)
+        out[i] = rx_packets[(rx_packet_count - 1 - (uint32_t)i) % LORA_RX_HISTORY];
+    portEXIT_CRITICAL(&mux);
+    return n;
+}
+uint32_t lora_rx_packet_count(void) {
+    portENTER_CRITICAL(&mux);
+    uint32_t n = rx_packet_count;
     portEXIT_CRITICAL(&mux);
     return n;
 }
@@ -103,7 +122,8 @@ static void apply_profile(bool generic) {
     reg_write(REG_FRF_MSB,(frf>>16)&255);
     reg_write(REG_FRF_MSB+1,(frf>>8)&255);
     reg_write(REG_FRF_MSB+2,frf&255);
-    reg_write(REG_MODEM_CONFIG1,(bi<<4)|0x02); /* CR 4/5, explicit */
+    const uint8_t cr = (generic && rx_cfg.coding_rate >= 5 && rx_cfg.coding_rate <= 8) ? rx_cfg.coding_rate : 5;
+    reg_write(REG_MODEM_CONFIG1,(bi<<4)|((cr-4)<<1)); /* explicit header: RX obtains CR from header */
     reg_write(REG_MODEM_CONFIG2,(sf<<4)|0x04); /* CRC on */
     reg_write(REG_MODEM_CONFIG3,0x04 | ((sf>=11 && bw<=125000)?0x08:0));
     reg_write(REG_SYNC_WORD,generic?rx_cfg.sync_word:0x12);
@@ -113,6 +133,7 @@ static void apply_profile(bool generic) {
 void lora_rx_get_config(lora_rx_config_t *out) { if(out) *out=rx_cfg; }
 static bool rx_cfg_valid(const lora_rx_config_t *c) {
     if(!c || c->freq_hz<400000000UL || c->freq_hz>525000000UL || c->sf<7 || c->sf>12)return false;
+    if(c->coding_rate && (c->coding_rate<5 || c->coding_rate>8))return false;
     static const uint32_t widths[]={7800,10400,15600,20800,31250,41700,62500,125000,250000,500000};
     for(int i=0;i<10;i++) if(c->bw_hz==widths[i])return true;
     return false;
@@ -167,12 +188,15 @@ static void task(void *arg) {
                         int rssi = -164 + (int)reg_read(REG_PKT_RSSI_VALUE);
                         if (snr < 0) rssi += (int)snr;
                         portENTER_CRITICAL(&mux);
-                        lora_aprs_packet_t *p = &packets[packet_count % LORA_APRS_HISTORY];
+                        lora_aprs_packet_t *p = generic_rx
+                            ? &rx_packets[rx_packet_count % LORA_RX_HISTORY]
+                            : &packets[packet_count % LORA_APRS_HISTORY];
                         snprintf(p->text, sizeof p->text, "%s", line);
                         p->rssi_dbm = rssi;
                         p->snr_db = snr;
                         p->tick_ms = pdTICKS_TO_MS(xTaskGetTickCount());
-                        packet_count++;
+                        if (generic_rx) rx_packet_count++;
+                        else packet_count++;
                         portEXIT_CRITICAL(&mux);
                         publish(line);
                     }
@@ -223,6 +247,14 @@ void lora_aprs_init(void) {
     if(nvs_open("lora_rx",NVS_READONLY,&h)==ESP_OK){
         lora_rx_config_t saved;size_t len=sizeof(saved);
         if(nvs_get_blob(h,"profile",&saved,&len)==ESP_OK && len==sizeof(saved) && rx_cfg_valid(&saved))rx_cfg=saved;
+        else {
+            struct {uint32_t freq_hz;uint8_t sf;uint32_t bw_hz;uint8_t sync_word;} old;
+            len=sizeof(old);
+            if(nvs_get_blob(h,"profile",&old,&len)==ESP_OK && len==sizeof(old)) {
+                lora_rx_config_t migrated={old.freq_hz,old.sf,old.bw_hz,old.sync_word,0};
+                if(rx_cfg_valid(&migrated))rx_cfg=migrated;
+            }
+        }
         nvs_close(h);
     }
     publish("LoRa APRS: SX1278 ready");

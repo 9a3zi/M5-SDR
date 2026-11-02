@@ -14,6 +14,13 @@
 void wifi_net_init(void);
 void wifi_net_apply_settings(void);
 
+uint8_t wifi_net_mode(void); /* 0 STA, 1 AP, 2 AP+STA */
+const char *wifi_net_mode_name(void);
+const char *wifi_net_ap_ip(void);
+const char *wifi_net_ap_ssid(void);
+const char *wifi_net_ap_password(void);
+bool wifi_net_set_mode(uint8_t mode);
+
 bool wifi_net_connected(void); /* has an IP address */
 bool wifi_net_time_ok(void);   /* SNTP has set the clock (needed for reports) */
 const char *wifi_net_ip(void); /* "0.0.0.0" when not connected */

@@ -6,8 +6,8 @@
  * Stage 3: stream IQ into a PSRAM ring buffer (see sdr.c).
  * Stage 4: FFT spectrum + waterfall (see dsp.c).
  *
- * app_main handles boot/enumeration with solid-colour status, then hands the
- * screen to the DSP renderer and just emits a periodic serial heartbeat.
+ * app_main starts the UI and network independently of RTL-SDR enumeration.
+ * USB SDR enumeration runs in its own FreeRTOS task.
  */
 #include <stdio.h>
 #include <inttypes.h>
@@ -24,6 +24,7 @@
 #include "audio.h"
 #include "ui.h"
 #include "wifi_net.h"
+#include "web_mirror.h"
 #include "psk.h"
 #include "lora_aprs.h"
 #include "rs41_log.h"
@@ -36,8 +37,6 @@ static const char *TAG = "tab5-sdr";
 
 #define RGB565(r, g, b) \
     ((uint16_t)(((((r) >> 3) & 0x1F) << 11) | ((((g) >> 2) & 0x3F) << 5) | (((b) >> 3) & 0x1F)))
-
-static uint16_t *fb(void) { return (uint16_t *)bsp_tab5_display_get_frame_buffer(0); }
 
 static void draw_test_pattern(void)
 {
@@ -70,16 +69,32 @@ static void draw_test_pattern(void)
     ESP_LOGI(TAG, "LCD test pattern sent");
 }
 
-static void fill_screen(uint16_t color)
+/* sdr_open() waits for the dongle. Never call it from app_main():
+ * otherwise the entire UI and Wi-Fi startup would wait for USB hardware.
+ * Do not draw directly here: the UI owns the framebuffer after ui_start(). */
+static void sdr_usb_task(void *arg)
 {
-    uint16_t *f = fb();
-    if (!f) return;
-    for (size_t i = 0; i < (size_t)PANEL_W * PANEL_H; i++) f[i] = color;
-    bsp_tab5_display_flush(0);
+    (void)arg;
+    ESP_LOGW(TAG, "RTL-SDR: waiting for USB dongle (UI remains available)");
+
+    sdr_open();
+    ESP_LOGW(TAG, "RTL-SDR: dongle opened");
+
+    if (!sdr_stream_start(SDR_DEFAULT_CENTER_FREQ, SDR_DEFAULT_SAMPLE_RATE)) {
+        ESP_LOGE(TAG, "RTL-SDR: unable to start IQ stream; UI remains active");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGW(TAG, "RTL-SDR: IQ stream started");
+    vTaskDelete(NULL);
 }
 
 void app_main(void)
 {
+    /* Quiet normal operation; keep warnings and errors for diagnostics. */
+    esp_log_level_set("*", ESP_LOG_WARN);
+
     ESP_LOGI(TAG, "Tab5-SDR boot — free heap %" PRIu32 ", PSRAM %u",
              esp_get_free_heap_size(), (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
@@ -98,14 +113,7 @@ void app_main(void)
     bsp_tab5_set_usb_host_power(true);
     vTaskDelay(pdMS_TO_TICKS(300));
 
-    fill_screen(RGB565(0, 0, 200)); /* blue: searching */
-    sdr_open();                     /* blocks until a dongle is opened */
-    fill_screen(RGB565(0, 120, 0)); /* green: opened */
-
-    if (!sdr_stream_start(SDR_DEFAULT_CENTER_FREQ, SDR_DEFAULT_SAMPLE_RATE)) {
-        fill_screen(RGB565(220, 0, 0)); /* red: stream failed */
-        return;
-    }
+    /* No blocking SDR enumeration here: boot must work without the dongle. */
 
     /* Speaker up, then demod + landscape UI take over the screen. */
     audio_init();
@@ -118,14 +126,18 @@ void app_main(void)
     /* WiFi (P4 ← C6 via esp_hosted) + SNTP, then the PSK Reporter uploader.
      * Non-fatal without a network: the receiver works offline. */
     wifi_net_init();
+    web_mirror_load_settings();
+    web_mirror_start();
     psk_init();
 
-    /* Heartbeat: confirm the stream stays drop-free under the DSP load. */
+    /* Enumerate the USB receiver asynchronously. This task can wait for
+     * sdr_open() without preventing Tab5 startup. */
+    if (xTaskCreate(sdr_usb_task, "sdr_usb", 8192, NULL, 5, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "RTL-SDR: could not create USB task");
+    }
+
+    /* No periodic serial heartbeat. Keep app_main alive. */
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(5000));
-        sdr_stats_t st;
-        sdr_get_stats(&st);
-        ESP_LOGI(TAG, "%.3f MHz, dropped=%llu bytes total",
-                 st.center_freq / 1e6, (unsigned long long)st.dropped_bytes);
     }
 }

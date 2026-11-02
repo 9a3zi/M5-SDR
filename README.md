@@ -36,6 +36,7 @@ strength, and firmware version. Features described here reflect the project impl
 - Touchscreen tuning, step selection, band shortcuts, signal indication and squelch threshold.
 - **PLAN** menu for scheduled FT8/WSPR reception (introduced in version 1.2).
 - Network reporting for supported digital modes; configure station and network settings before use.
+- Added AP and STA wifi mode that enables a complete display of the LCD display on the web server and mouse control at the local IP address.
 
 ## Hardware
 

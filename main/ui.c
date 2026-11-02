@@ -13,6 +13,7 @@
  * delay; after the idle timeout the backlight turns off and any touch wakes it.
  */
 #include "ui.h"
+#include "web_mirror.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -38,6 +39,7 @@
 #include "sdr.h"
 #include "dsp.h"
 #include "rs41.h"
+#include "rs41_font.h"
 #include "ft8.h"
 #include "wspr.h"
 #include "audio.h"
@@ -311,6 +313,39 @@ static void seg7_digit(int x, int y, int dw, int dh, int t, int d, uint16_t c)
     if (m & 64) rect(x + t, y + t + hh, dw - 2 * t, t, c);
 }
 
+/* Anti-aliased RS41-only text; blends with the RGB565 framebuffer. */
+static void rs41_smooth_text(int x, int y, uint16_t fg, const char *str)
+{
+    int fr = ((fg >> 11) & 31) * 255 / 31;
+    int fgc = ((fg >> 5) & 63) * 255 / 63;
+    int fb = (fg & 31) * 255 / 31;
+    for (; *str && x < LW; ++str, x += RSFONT_W) {
+        unsigned char ch = (unsigned char)*str;
+        if (ch < 32 || ch > 126) ch = '?';
+        const uint8_t *glyph_a = rsfont_alpha + (ch - 32) * RSFONT_W * RSFONT_H;
+        for (int yy = 0; yy < RSFONT_H; ++yy) {
+            int py = y + yy;
+            if (py < 0 || py >= LH) continue;
+            for (int xx = 0; xx < RSFONT_W; ++xx) {
+                int px = x + xx;
+                if (px < 0 || px >= LW) continue;
+                unsigned a = glyph_a[yy * RSFONT_W + xx];
+                if (!a) continue;
+                uint16_t *dst = &LBUF[(size_t)py * LW + px];
+                if (a == 255) { *dst = fg; continue; }
+                uint16_t bg = *dst;
+                int br = ((bg >> 11) & 31) * 255 / 31;
+                int bgc = ((bg >> 5) & 63) * 255 / 63;
+                int bb = (bg & 31) * 255 / 31;
+                int r = (fr * (int)a + br * (255 - (int)a) + 127) / 255;
+                int g = (fgc * (int)a + bgc * (255 - (int)a) + 127) / 255;
+                int b = (fb * (int)a + bb * (255 - (int)a) + 127) / 255;
+                *dst = RGB565(r, g, b);
+            }
+        }
+    }
+}
+
 /* ---- mode helpers -------------------------------------------------------- */
 
 static uint16_t mode_color(int m)
@@ -412,6 +447,19 @@ static void draw_header(void)
     }
     text(mx, my + mh + 2, 1, COL_TEXT, "SIG");
     draw_cpu_temp();
+    /* IP in the upper-left corner of the main screen (small text). */
+    if (web_mirror_enabled()) {
+        char addr[48];
+        if (wifi_net_mode() != 0)
+            snprintf(addr, sizeof addr, "WEB %s", wifi_net_ap_ip());
+        else if (wifi_net_connected())
+            snprintf(addr, sizeof addr, "WEB %s", wifi_net_ip());
+        else
+            snprintf(addr, sizeof addr, "WEB WAIT WIFI");
+        text(6, 34, 1, RGB565(130,230,255), addr);
+    } else {
+        text(6, 34, 1, RGB565(170,180,200), "WEB OFF");
+    }
 }
 
 /* ---- spectrum + waterfall ------------------------------------------------ */
@@ -444,14 +492,14 @@ static void draw_rs41_panel(void)
     rect(0, WF_Y0, LW, WF_H, RGB565(0, 0, 0));
 
     rect(540, WF_Y0 + 3, 92, 23, RGB565(30, 90, 110));
-    text(555, WF_Y0 + 8, 2, COL_TEXT, "LOG");
+    rs41_smooth_text(555, WF_Y0 + 8, COL_TEXT, "LOG");
     const int x = 8, pitch = 18;
     int y = WF_Y0 + 4;
     char b[128];
     if (!have) {
-        text(x, y, 2, RGB565(230, 230, 230), "WAITING FOR RS41");
-        text(x, y + pitch, 2, RGB565(150, 150, 150), "TUNE 400-406 MHZ");
-        text(x, y + 2 * pitch, 2, RGB565(150, 150, 150), "PRESS RS41 AGAIN TO CENTRE ON THE PEAK");
+        rs41_smooth_text(x, y, RGB565(230, 230, 230), "WAITING FOR RS41");
+        rs41_smooth_text(x, y + pitch, RGB565(150, 150, 150), "TUNE 400-406 MHZ");
+        rs41_smooth_text(x, y + 2 * pitch, RGB565(150, 150, 150), "PRESS RS41 AGAIN TO CENTRE ON THE PEAK");
         return;
     }
     if (in.seq != last_seq) { last_seq = in.seq; last_tick = xTaskGetTickCount(); }
@@ -460,24 +508,24 @@ static void draw_rs41_panel(void)
     uint16_t ci = stale ? RGB565(120, 120, 120) : RGB565(255, 220, 0);
 
     snprintf(b, sizeof b, "ID %s  FRM %u", in.have_id ? in.id : "-", (unsigned)in.frame_no);
-    text(x, y, 2, ci, b);
+    rs41_smooth_text(x, y, ci, b);
     y += pitch;
-    if (in.have_pos) snprintf(b, sizeof b, "LAT %.5f  LON %.5f", in.lat, in.lon);
+    if (in.have_pos) snprintf(b, sizeof b, "LAT: %.5f  LON: %.5f", in.lat, in.lon);
     else if (in.encrypted) snprintf(b, sizeof b, "POSITION ENCRYPTED  RS41 SGM");
     else snprintf(b, sizeof b, "LAT -  LON -");
-    text(x, y, 2, cv, b);
+    rs41_smooth_text(x, y, cv, b);
     y += pitch;
-    if (in.have_pos) snprintf(b, sizeof b, "ALT %.0f M  VH %.1f  VV %.1f  HDG %.0f", in.alt, in.vh, in.vv, in.vd);
+    if (in.have_pos) snprintf(b, sizeof b, "ALT: %.0f m  VH: %.1f km/h  VV: %.1f m/s  HDG: %.0f", in.alt, (double)(in.vh * 3.6f), in.vv, in.vd);
     else snprintf(b, sizeof b, "ALT -");
-    text(x, y, 2, cv, b);
+    rs41_smooth_text(x, y, cv, b);
     y += pitch;
     if (in.have_time) snprintf(b, sizeof b, "UTC %02d:%02d:%02d  SAT %u", in.hh, in.mm, in.ss, (unsigned)in.sats);
     else snprintf(b, sizeof b, "UTC -");
-    text(x, y, 2, cv, b);
+    rs41_smooth_text(x, y, cv, b);
     y += pitch;
     if (in.rs_fixed < 0) snprintf(b, sizeof b, "OK %u  BAD %u  RS FAIL  MK %u/7  BLK %u", (unsigned)in.frames_ok, (unsigned)in.frames_bad, (unsigned)in.mk, (unsigned)in.blk_ok);
     else snprintf(b, sizeof b, "OK %u  BAD %u  RS %d  MK %u/7  BLK %u", (unsigned)in.frames_ok, (unsigned)in.frames_bad, in.rs_fixed, (unsigned)in.mk, (unsigned)in.blk_ok);
-    text(x, y, 2, RGB565(150, 150, 150), b);
+    rs41_smooth_text(x, y, RGB565(150, 150, 150), b);
 }
 
 /* FT8 / WSPR: the waterfall area shows the decoded messages, newest first, in three
@@ -599,18 +647,18 @@ static void draw_aprs_panel(void)
     rect(0, SPEC_Y0, LW, WF_Y0 + WF_H - SPEC_Y0, COL_BG);
     char b[150];
     snprintf(b, sizeof b, "APRS AFSK1200  %.3f MHZ", s_center / 1e6);
-    text(8, SPEC_Y0 + 4, 2, COL_ACCENT, b);
+    rs41_smooth_text(8, SPEC_Y0 + 3, COL_ACCENT, b);
     snprintf(b, sizeof b, "OK %lu  CRC ERR %lu  FLAGS %lu  AFSK %d%%", (unsigned long)aprs_packet_count(),
              (unsigned long)aprs_crc_errors(), (unsigned long)aprs_flags(), aprs_quality_pct());
-    text(8, SPEC_Y0 + 26, 1, COL_LINE, b);
+    rs41_smooth_text(8, SPEC_Y0 + 23, COL_LINE, b);
     aprs_packet_t pk[APRS_HISTORY];
     int n = aprs_packets(pk, APRS_HISTORY);
-    if (!n) { text(8, SPEC_Y0 + 55, 2, COL_TEXT, "WAITING FOR APRS PACKET..."); return; }
+    if (!n) { rs41_smooth_text(8, SPEC_Y0 + 51, COL_TEXT, "WAITING FOR APRS PACKET..."); return; }
     for (int i = 0; i < n; ++i) {
         char line[101];
-        snprintf(line, sizeof line, "%.100s", pk[i].text);
+        snprintf(line, sizeof line, "%.62s", pk[i].text);
         line[100] = 0;
-        text(8, SPEC_Y0 + 46 + i * 22, 1, i ? COL_TEXT : COL_ACCENT, line);
+        rs41_smooth_text(8, SPEC_Y0 + 44 + i * 19, i ? COL_TEXT : COL_ACCENT, line);
     }
 }
 
@@ -625,9 +673,9 @@ static void draw_lora_panel(void)
     int n = lora_aprs_packets(p, LORA_APRS_HISTORY);
     if (!n) {
         lora_aprs_status(b, sizeof b);
-        b[68] = 0;
-        horus_text(8, SPEC_Y0 + 47, COL_TEXT, b);
-        horus_text(8, SPEC_Y0 + 68, COL_ACCENT, "WAITING FOR APRS PACKET...");
+        b[61] = 0;
+        rs41_smooth_text(8, SPEC_Y0 + 47, COL_TEXT, b);
+        rs41_smooth_text(8, SPEC_Y0 + 68, COL_ACCENT, "WAITING FOR APRS PACKET...");
         return;
     }
     for (int i = 0; i < n; ++i) {
@@ -635,8 +683,8 @@ static void draw_lora_panel(void)
         snprintf(b, sizeof b, "%d RSSI:%d SNR:%+.1f", i + 1, p[i].rssi_dbm, (double)p[i].snr_db);
         text(8, y, 1, i == 0 ? COL_LINE : COL_ACCENT, b);
         snprintf(b, sizeof b, "%s", p[i].text);
-        b[68] = 0;
-        horus_text(8, y + 9, COL_TEXT, b);
+        b[61] = 0;
+        rs41_smooth_text(8, y + 9, COL_TEXT, b);
     }
 }
 
@@ -679,11 +727,11 @@ static void draw_spectrum(const float *spec, int bins)
         if (s_mode == DSP_MODE_HORUS) {
             /* HORUS: six medium-font lines (1.5x) with more vertical spacing.
              * Keep FT8/WSPR, other UI panels and decoder logic untouched. */
-            const int hx = 8, hy = WF_Y0 + 3, hp = 16;
+            const int hx = 8, hy = WF_Y0 + 2, hp = 15;
             rect(4, WF_Y0 + 2, 632, WF_H - 4, COL_BG);
             horus_decoder_status(msg, sizeof msg);
-            msg[68] = 0; /* 68 glyphs * 9 px = 612 px */
-            horus_text(hx, hy, COL_ACCENT, msg);
+            msg[62] = 0; /* 62 glyphs * 10 px = 620 px */
+            rs41_smooth_text(hx, hy, COL_ACCENT, msg);
             horus_v1_telemetry_t v;
             if (horus_decoder_get_telemetry(&v)) {
                 const char *payload_name = (v.version == 3) ? v.callsign : horus_payload_name(v.payload_id);
@@ -697,18 +745,18 @@ static void draw_spectrum(const float *spec, int bins)
                     snprintf(msg, sizeof msg, "V%u  ID:%u  PKT:%u  CRC:OK",
                              v.version, v.payload_id, v.sequence);
                 }
-                msg[68] = 0;
-                horus_text(hx, hy + hp, COL_LINE, msg);
+                msg[62] = 0;
+                rs41_smooth_text(hx, hy + hp, COL_LINE, msg);
                 snprintf(msg, sizeof msg, "UTC %02u:%02u:%02u", v.hour, v.minute, v.second);
-                horus_text(hx, hy + 2 * hp, COL_TEXT, msg);
+                rs41_smooth_text(hx, hy + 2 * hp, COL_TEXT, msg);
                 snprintf(msg, sizeof msg, "LAT %.6f  LON %.6f",
                          (double)v.latitude, (double)v.longitude);
-                msg[68] = 0;
-                horus_text(hx, hy + 3 * hp, COL_TEXT, msg);
+                msg[62] = 0;
+                rs41_smooth_text(hx, hy + 3 * hp, COL_TEXT, msg);
                 snprintf(msg, sizeof msg, "ALT %u m  SPD %u km/h  SAT %u",
                          v.altitude, v.speed, v.satellites);
-                msg[68] = 0;
-                horus_text(hx, hy + 4 * hp, COL_TEXT, msg);
+                msg[62] = 0;
+                rs41_smooth_text(hx, hy + 4 * hp, COL_TEXT, msg);
                 if (v.version == 3) {
                     char temp[24], bat[24];
                     if (v.v3_has_temperature) snprintf(temp, sizeof temp, "%d C", v.temperature);
@@ -720,18 +768,18 @@ static void draw_spectrum(const float *spec, int bins)
                     snprintf(msg, sizeof msg, "TEMP %d C  BAT %.2f V",
                              v.temperature, (double)(v.battery_raw * (5.0f / 255.0f)));
                 }
-                horus_text(hx, hy + 5 * hp, COL_TEXT, msg);
+                rs41_smooth_text(hx, hy + 5 * hp, COL_TEXT, msg);
             } else {
                 char raw[260]; unsigned ver = 0, len = 0; bool parsed = false;
                 horus_decoder_raw(raw, sizeof(raw), &ver, &len, &parsed);
                 if (len) {
                     snprintf(msg, sizeof msg, "CRC OK  V%u  HEX:%u  PARSE:%s",
                              ver, len, parsed ? "OK" : "NE");
-                    horus_text(hx, hy + hp, COL_TEXT, msg);
-                    raw[68] = 0;
-                    horus_text(hx, hy + 2 * hp, COL_TEXT, raw);
+                    rs41_smooth_text(hx, hy + hp, COL_TEXT, msg);
+                    raw[62] = 0;
+                    rs41_smooth_text(hx, hy + 2 * hp, COL_TEXT, raw);
                 } else {
-                    horus_text(hx, hy + 2 * hp, COL_TEXT, "CEKAM HORUS PAKET...");
+                    rs41_smooth_text(hx, hy + 2 * hp, COL_TEXT, "WAITING FOR HORUS PACKET...");
                 }
             }
         }
@@ -744,13 +792,14 @@ typedef struct { int x, y, w, h; } box_t;
 static const box_t B_TDN  = {  6, 220, 52, 44};  /* tune down one step */
 static const box_t B_STEP = { 62, 220, 84, 44};  /* cycle step size    */
 static const box_t B_TUP  = {150, 220, 52, 44};  /* tune up one step   */
-static const box_t B_RS41 = {210, 220, 88, 44};  /* RS41 mode; pressed again in RS41 mode = centre on the strongest peak */
-static const box_t B_GAIN = {306, 220, 44, 44};  /* tuner gain: AGC / manual steps */
-static const box_t B_PLAN = {358, 220, 88, 44};  /* band-plan menu: time-scheduled FT8/WSPR band hopping */
+static const box_t B_RS41 = {210, 220, 58, 44};  /* RS41 mode; pressed again in RS41 mode = centre on the strongest peak */
+static const box_t B_GAIN = {272, 220, 44, 44};  /* tuner gain: AGC / manual steps */
+static const box_t B_PLAN = {396, 220, 50, 44};  /* band-plan menu: time-scheduled FT8/WSPR band hopping */
 static const box_t B_HF   = {  6, 272, 64, 44};
 static const box_t B_VHF  = { 74, 272, 64, 44};
 static const box_t B_UHF  = {142, 272, 64, 44};
-static const box_t B_PSK  = {210, 272, 72, 44}; /* PSK Reporter upload checkbox */
+static const box_t B_PSK  = {320, 220, 72, 44}; /* PSK Reporter upload checkbox */
+static const box_t B_LORARX = {210, 272, 72, 44}; /* Direct LoRa RX entry */
 static const box_t B_HORUS = {286, 272, 50, 44};
 static const box_t B_LORA = {339, 272, 54, 44};
 static const box_t B_APRS = {396, 272, 52, 44};
@@ -798,10 +847,9 @@ static void draw_controls(void)
             bp_slot_t cur;
             char bn[8];
             if (bandplan_current(&cur)) {
-                char st[24];
-                snprintf(st, sizeof st, "%s %s", dsp_mode_name(cur.mode),
-                         bandplan_band_name(bandplan_slot_freq(&cur), bn, sizeof bn));
-                text(B_PLAN.x + (B_PLAN.w - text_w(st, 1)) / 2, B_PLAN.y + 28, 1, RGB565(190, 255, 210), st);
+                bandplan_band_name(bandplan_slot_freq(&cur), bn, sizeof bn);
+                /* Narrow PLAN button: show short band identifier without overflow. */
+                text(B_PLAN.x + (B_PLAN.w - text_w(bn, 1)) / 2, B_PLAN.y + 28, 1, RGB565(190, 255, 210), bn);
             } else {
                 const char *warn = (bandplan_active() == BP_USER && bandplan_user_n() == 0) ? "EMPTY" : "NO CLOCK";
                 text(B_PLAN.x + (B_PLAN.w - text_w(warn, 1)) / 2, B_PLAN.y + 28, 1,
@@ -838,6 +886,7 @@ static void draw_controls(void)
                        RGB565(220, 170, 40));
     }
 }
+    draw_box(&B_LORARX, "LoRaRX", 1, lora_rx_enabled() ? RGB565(24,110,70) : COL_BTN);
     draw_box(&B_HORUS, "HORUS", 1, (s_mode == DSP_MODE_HORUS) ? COL_BTN_HI : COL_BTN);
     draw_box(&B_LORA, "L-APRS", 1, lora_aprs_enabled() ? RGB565(24,110,70) : COL_BTN);
     draw_box(&B_APRS, "APRS", 1, (s_mode == DSP_MODE_APRS) ? RGB565(24,110,70) : COL_BTN);
@@ -1324,10 +1373,38 @@ static void rs41_log_draw(void)
         fgets(line, sizeof line, f);
         while (skip-- > 0 && fgets(line, sizeof line, f)) {}
         while (row < 10 && fgets(line, sizeof line, f)) {
-            char out[96];
-            /* Show first fields: serial, frame, frequency and GPS week. */
-            snprintf(out, sizeof out, "%.72s", line);
-            out[strcspn(out, "\r\n")] = 0;
+            char out[192];
+            /* Existing RS41 CSV: serial, frame, ..., has_position,
+             * latitude, longitude, altitude_m, speed_ms, heading_deg,
+             * climb_ms, satellites, rs_fixed, crc_blocks. */
+            char *fields[18] = {0};
+            int nf = 0;
+            char *start = line;
+            for (char *q = line; ; ++q) {
+                if (*q == ',' || *q == '\r' || *q == '\n' || *q == 0) {
+                    char end = *q;
+                    *q = 0;
+                    if (nf < 18) fields[nf++] = start;
+                    start = q + 1;
+                    if (end != ',') break;
+                }
+            }
+            if (nf >= 15 && fields[8][0] == '1' && fields[9][0] && fields[10][0]) {
+                /* RS41 vh is horizontal wind speed in m/s; vv is vertical
+                 * speed in m/s (negative during descent). */
+                float wind_kmh = strtof(fields[12], NULL) * 3.6f;
+                float vv = strtof(fields[14], NULL);
+                float descent_ms = vv < 0.0f ? -vv : 0.0f;
+                snprintf(out, sizeof out,
+                         "%.8s FRM: %.6s LAT: %.10s LON: %.11s A/D: %.1fm/s WIND: %.1fkm/h ALT: %.8sm",
+                         fields[0], fields[1], fields[9], fields[10],
+                         descent_ms, wind_kmh, fields[11]);
+            } else if (nf >= 12) {
+                snprintf(out, sizeof out, "%.8s FRM %.6s GPS - ALT -",
+                         fields[0], fields[1]);
+            } else {
+                snprintf(out, sizeof out, "INVALID CSV RECORD");
+            }
             text(12, 72 + row*23, 1, COL_TEXT, out);
             row++;
         }
@@ -1369,8 +1446,8 @@ static bool rs41_log_touch(int x, int y)
 
 
 /* PLAN menu: OFF, USER PLAN, EDIT USER PLAN, SCREEN OFF, SETTINGS, CLOSE. */
-#define M1_ROWS      7
-static const int s_plan_menu_actions[M1_ROWS] = {BP_OFF, BP_USER, -1, -2, -3, -5, -4};
+#define M1_ROWS      6
+static const int s_plan_menu_actions[M1_ROWS] = {BP_OFF, BP_USER, -1, -2, -3, -4};
 #define M1_ROW_Y0    48
 #define M1_ROW_PITCH 32
 #define M1_ROW_H     28
@@ -1414,31 +1491,47 @@ static void settings_draw(void)
 {
     rect(0,0,LW,LH,RGB565(10,14,30));
     if (s_menu == 5) {
-        text(12,8,2,COL_ACCENT,"STATION SETTINGS");
-        text(12,32,1,COL_TEXT,"TAP FIELD TO EDIT - SAVE WRITES FLASH NVS");
+        text(12,5,2,COL_ACCENT,"STATION SETTINGS");
         const char *labels[4] = {"WIFI SSID","WIFI PASSWORD","CALLSIGN","QTH LOCATOR"};
         const char *values[4] = {s_st_edit.ssid,"********",s_st_edit.callsign,s_st_edit.grid};
         for (int i=0;i<4;i++) {
-            int y=58+i*48;
-            rect(12,y,616,42,COL_BTN);
+            int y=34+i*45;
+            rect(12,y,616,40,COL_BTN);
             text(22,y+6,2,COL_TEXT,labels[i]);
             text(290,y+6,2,RGB565(130,230,255),values[i]);
         }
-        rect(12,264,294,44,RGB565(25,100,65));
-        text(95,276,2,COL_TEXT,"SAVE");
-        rect(334,264,294,44,COL_BTN);
-        text(424,276,2,COL_TEXT,"BACK");
-        if (s_st_saved) text(14,314,1,RGB565(150,255,160),"SAVED - WIFI RECONNECTING");
+        rect(12,220,294,40,RGB565(25,100,65));
+        text(95,230,2,COL_TEXT,"SAVE");
+        rect(334,220,294,40,COL_BTN);
+        text(424,230,2,COL_TEXT,"BACK");
+        rect(12,269,302,37,COL_BTN);
+        rect(324,269,304,37,web_mirror_enabled() ? RGB565(25,100,65) : COL_BTN);
+        char mode_label[48];
+        snprintf(mode_label,sizeof mode_label,"WIFI: %s",wifi_net_mode_name());
+        text(20,278,2,COL_TEXT,mode_label);
+        text(337,278,2,COL_TEXT,web_mirror_enabled() ? "WEB: ON" : "WEB: OFF");
+        char web_url[100];
+        if (wifi_net_mode() != 0) {
+            snprintf(web_url,sizeof web_url,"AP: %s  http://%s/",wifi_net_ap_ssid(),wifi_net_ap_ip());
+            text(14,313,1,RGB565(130,230,255),web_url);
+            snprintf(web_url,sizeof web_url,"AP PASS: %s",wifi_net_ap_password());
+            text(14,331,1,COL_TEXT,web_url);
+        } else if (wifi_net_connected()) {
+            snprintf(web_url,sizeof web_url,"WEB: http://%s/",wifi_net_ip());
+            text(14,318,1,RGB565(130,230,255),web_url);
+        } else {
+            text(14,318,1,COL_TEXT,"WEB: WIFI NOT CONNECTED");
+        }
+        if (s_st_saved) text(370,317,1,RGB565(150,255,160),"SAVED");
         return;
     }
     const char *labels[4]={"WIFI SSID","WIFI PASSWORD","CALLSIGN","QTH LOCATOR"};
     text(12,6,2,COL_ACCENT,labels[s_st_field]);
     char shown[72];
     const char *v=settings_field();
-    if (s_st_field == 1) {
-        size_t n=strlen(v); if(n>60)n=60;
-        memset(shown,'*',n); shown[n]=0;
-    } else snprintf(shown,sizeof shown,"%s",v);
+    /* Show actual characters while editing the WiFi password.
+       The SETTINGS overview continues to mask the password. */
+    snprintf(shown, sizeof shown, "%s", v);
     rect(12,36,616,44,COL_BTN);
     text(20,48,2,COL_TEXT,shown);
     const char *keys[4]={"1234567890","QWERTYUIOP","ASDFGHJKL-","ZXCVBNM._@"};
@@ -1461,12 +1554,21 @@ static void settings_draw(void)
 static bool settings_touch(int x,int y)
 {
     if(s_menu==5) {
-        if(y>=58 && y<250) {int i=(y-58)/48; if(i<4){s_st_field=i;s_st_lower=(i<=1);s_menu=6;}return true;}
-        if(y>=264 && y<310) {
+        if(y>=34 && y<214) {
+            int i=(y-34)/45;
+            if(i<4){s_st_field=i;s_st_lower=(i<=1);s_menu=6;}
+            return true;
+        }
+        if(y>=220 && y<262) {
             if(x<318) {
                 s_st_saved=station_settings_save(&s_st_edit);
                 if(s_st_saved)wifi_net_apply_settings();
             } else {s_menu=1;}
+            return true;
+        }
+        if(y>=269 && y<309) {
+            if (x < 320) wifi_net_set_mode((wifi_net_mode()+1)%3);
+            else web_mirror_set_enabled(!web_mirror_enabled());
             return true;
         }
         return true;
@@ -1505,7 +1607,7 @@ static void lr_draw(void) {
     rect(0,0,LW,LH,RGB565(10,14,30));
     char b[128];
     if(s_menu==8) {
-        const char *names[]={"FREQUENCY MHZ","SF (7-12)","BW KHZ","SYNC WORD HEX"};
+        const char *names[]={"FREQUENCY MHZ","SF (7-12)","BW KHZ","SYNC WORD HEX","CODING RATE (OFF, 5-8)"};
         text(12,8,2,COL_ACCENT,names[s_lr_field]);
         rect(12,40,616,45,COL_BTN);text(22,51,2,COL_TEXT,s_lr_input);
         const char *rows[]={"123","456","789",".0X"};
@@ -1513,7 +1615,8 @@ static void lr_draw(void) {
             int x=12+c*154,y=96+r*47;rect(x,y,148,42,COL_BTN);
             char ch[2]={rows[r][c],0};text(x+60,y+10,2,COL_TEXT,ch);
         }
-        rect(476,96,152,90,COL_BTN);text(505,126,2,COL_TEXT,"DEL");
+        rect(476,96,152,43,COL_BTN);text(505,105,2,COL_TEXT,"DEL");
+        if(s_lr_field==4){rect(476,144,152,42,COL_BTN);text(505,153,2,COL_TEXT,"OFF");}
         rect(476,192,152,90,RGB565(25,100,65));text(510,222,2,COL_TEXT,"OK");
         rect(12,292,616,32,COL_BTN);text(280,300,2,COL_TEXT,"BACK");
         return;
@@ -1521,14 +1624,17 @@ static void lr_draw(void) {
     text(12,5,2,COL_ACCENT,"LORA RX - LIVE PACKETS");
     snprintf(b,sizeof b,"FREQ %.3f MHz   SF%u   BW %.2f kHz   SW 0x%02X",s_lr_edit.freq_hz/1000000.0,(unsigned)s_lr_edit.sf,s_lr_edit.bw_hz/1000.0,(unsigned)s_lr_edit.sync_word);
     text(12,29,1,COL_TEXT,b);
-    const char *names[]={"FREQ","SF","BW","SYNC"};
-    for(int i=0;i<4;i++){int x=12+i*156;rect(x,49,150,35,COL_BTN);text(x+18,58,2,COL_TEXT,names[i]);}
-    snprintf(b,sizeof b,"PACKETS: %lu",(unsigned long)lora_aprs_packet_count());text(12,92,1,COL_ACCENT,b);
-    lora_aprs_packet_t pk[LORA_APRS_HISTORY];int n=lora_aprs_packets(pk,LORA_APRS_HISTORY);
-    for(int i=0;i<n;i++){
-        int y=110+i*34;
-        snprintf(b,sizeof b,"SNR %.1f  %.60s",(double)pk[i].snr_db,pk[i].text);
-        b[76]=0;text(12,y,1,COL_TEXT,b);
+    const char *names[]={"FREQ","SF","BW","SYNC","CR"};
+    for(int i=0;i<5;i++){int x=12+i*125;rect(x,49,119,35,COL_BTN);text(x+12,58,2,COL_TEXT,names[i]);}
+    snprintf(b,sizeof b,"CR: %s",s_lr_edit.coding_rate==0?"AUTO":s_lr_edit.coding_rate==5?"4/5":s_lr_edit.coding_rate==6?"4/6":s_lr_edit.coding_rate==7?"4/7":"4/8");
+    text(350,92,1,COL_TEXT,b);
+    snprintf(b,sizeof b,"PACKETS: %lu",(unsigned long)lora_rx_packet_count());text(12,92,1,COL_ACCENT,b);
+    lora_aprs_packet_t pk[LORA_RX_HISTORY];int n=lora_rx_packets(pk,LORA_RX_HISTORY);
+    /* Larger font for received LoRa packets; fit lines above SAVE/BACK. */
+    for(int i=0;i<n && i<8;i++){
+        int y=112+i*22;
+        snprintf(b,sizeof b,"SNR %.1f  %.30s",(double)pk[i].snr_db,pk[i].text);
+        rs41_smooth_text(12,y,COL_TEXT,b);
     }
     rect(12,288,298,40,RGB565(25,100,65));text(100,298,2,COL_TEXT,"SAVE");
     rect(330,288,298,40,COL_BTN);text(420,298,2,COL_TEXT,"BACK");
@@ -1536,12 +1642,13 @@ static void lr_draw(void) {
 }
 static bool lr_touch(int x,int y){
     if(s_menu==7){
-        if(y>=49 && y<87){int i=(x-12)/156;if(x>=12 && i>=0 && i<4){
+        if(y>=49 && y<87){int i=(x-12)/125;if(x>=12 && i>=0 && i<5){
             s_lr_field=i;
             if(i==0)snprintf(s_lr_input,sizeof s_lr_input,"%.3f",s_lr_edit.freq_hz/1000000.0);
             if(i==1)snprintf(s_lr_input,sizeof s_lr_input,"%u",(unsigned)s_lr_edit.sf);
             if(i==2)snprintf(s_lr_input,sizeof s_lr_input,"%.2f",s_lr_edit.bw_hz/1000.0);
             if(i==3)snprintf(s_lr_input,sizeof s_lr_input,"%02X",(unsigned)s_lr_edit.sync_word);
+            if(i==4)snprintf(s_lr_input,sizeof s_lr_input,"%u",(unsigned)s_lr_edit.coding_rate);
             s_menu=8;
         }return true;}
         if(y>=288){
@@ -1552,13 +1659,16 @@ static bool lr_touch(int x,int y){
         return true;
     }
     if(y>=292){s_menu=7;return true;}
-    if(x>=476 && y>=96 && y<186){size_t n=strlen(s_lr_input);if(n)s_lr_input[n-1]=0;return true;}
+    if(x>=476 && y>=96 && y<139){size_t n=strlen(s_lr_input);if(n)s_lr_input[n-1]=0;return true;}
+    if(x>=476 && y>=144 && y<186 && s_lr_field==4){snprintf(s_lr_input,sizeof s_lr_input,"OFF");return true;}
     if(x>=476 && y>=192 && y<282){
         char *end=NULL;
         if(s_lr_field==0){double v=strtod(s_lr_input,&end);if(end!=s_lr_input && !*end && v>=400 && v<=525)s_lr_edit.freq_hz=(uint32_t)(v*1000000+0.5);}
         if(s_lr_field==1){long v=strtol(s_lr_input,&end,10);if(end!=s_lr_input && !*end && v>=7 && v<=12)s_lr_edit.sf=(uint8_t)v;}
         if(s_lr_field==2){double v=strtod(s_lr_input,&end);const uint32_t widths[]={7800,10400,15600,20800,31250,41700,62500,125000,250000,500000};for(int i=0;i<10;i++)if(fabs(v*1000-widths[i])<80)s_lr_edit.bw_hz=widths[i];}
         if(s_lr_field==3){const char *t=s_lr_input;if(t[0]=='0' && (t[1]=='x'||t[1]=='X'))t+=2;unsigned long v=strtoul(t,&end,16);if(end!=t && !*end && v<=255)s_lr_edit.sync_word=(uint8_t)v;}
+        if(s_lr_field==4){if(strcmp(s_lr_input,"OFF")==0 || strcmp(s_lr_input,"0")==0)s_lr_edit.coding_rate=0;
+            else {long v=strtol(s_lr_input,&end,10);if(end!=s_lr_input && !*end && v>=5 && v<=8)s_lr_edit.coding_rate=(uint8_t)v;}}
         s_lr_saved=false;s_menu=7;return true;
     }
     if(y>=96 && y<284 && x>=12 && x<470){int r=(y-96)/47,c=(x-12)/154;if(r<4 && c<3){const char *rows[]={"123","456","789",".0X"};char ch=rows[r][c];size_t n=strlen(s_lr_input);if(n+1<sizeof s_lr_input){s_lr_input[n]=ch;s_lr_input[n+1]=0;}}return true;}
@@ -1686,7 +1796,7 @@ static void draw_menu(void)
             rect(r.x, r.y, r.w, 2, COL_BTN_HI);
             const char *label = action >= 0 ? bandplan_name(action) :
                 (action == -1 ? "EDIT USER PLAN" : action == -2 ? "SCREEN OFF" :
-                 action == -3 ? "SETTINGS" : action == -5 ? "LORA RX" : "CLOSE");
+                 action == -3 ? "SETTINGS" : "CLOSE");
             text(r.x + 12, r.y + 8, 2, COL_TEXT, label);
             if (action >= 0) {
                 plan_info(action, b, sizeof b);
@@ -1741,12 +1851,6 @@ static bool menu_touch(int x, int y)
                 else if (action == -1) s_menu = 2;
                 else if (action == -2) { s_scr_off_i = (s_scr_off_i + 1) % N_SCR_OFF; scr_off_save(); }
                 else if (action == -3) { station_settings_get(&s_st_edit); s_st_saved=false; s_menu=5; }
-                else if (action == -5) {
-                    lora_rx_get_config(&s_lr_edit);s_lr_saved=false;
-                    lora_rx_enable(true);
-                    if(lora_rx_enabled()) {sdr_set_iq_discard(true);audio_set_volume(0);s_menu=7;}
-                    else {s_lora_error_until=xTaskGetTickCount()+pdMS_TO_TICKS(5000);menu_close();}
-                }
                 else menu_close();
                 return true;
             }
@@ -1803,6 +1907,13 @@ static bool handle_touch(void)
 
     esp_lcd_touch_point_data_t p[2];
     int n = bsp_tab5_touch_read(p, 2);
+    /* Web pointer uses the same touch pipeline. Physical touch takes priority. */
+    int wx, wy; bool wd;
+    if (n == 0 && web_mirror_pointer(&wx, &wy, &wd) && wd) {
+        p[0].x = wy * SCALE;
+        p[0].y = PANEL_H - wx * SCALE;
+        n = 1;
+    }
 
     /* ~1.2 s startup grace: the touch controller reports stray points right after
      * init that would otherwise "tap" a control. */
@@ -1937,7 +2048,7 @@ static bool handle_touch(void)
         dragging = false;
         if (s_mode == DSP_MODE_RS41 && lx >= 540 && ly >= WF_Y0 + 3 && ly < WF_Y0 + 29) {
             s_log_page = 0; rs41_log_refresh(); s_menu = 3; changed = true;
-        } else if (lora_aprs_enabled() && !hit(&B_LORA, lx, ly)) { /* LoRa owns the receiver. */ }
+        } else if (lora_aprs_enabled() && !hit(&B_LORA, lx, ly) && !hit(&B_LORARX, lx, ly)) { /* LoRa owns the receiver. */ }
         else if (hit(&B_TDN, lx, ly)) { retune((int64_t)s_center - STEPS[s_step_i]); changed = true; }
         else if (hit(&B_TUP, lx, ly)) { retune((int64_t)s_center + STEPS[s_step_i]); changed = true; }
         else if (hit(&B_STEP, lx, ly)) { s_step_i = (s_step_i + 1) % N_STEPS; changed = true; }
@@ -1970,6 +2081,19 @@ static bool handle_touch(void)
             band_press(BAND_UHF, BM_UHF, BM_UHF_N, &s_bm_uhf, "UHF LAST"); changed = true;
         } else if (hit(&B_PSK, lx, ly)) {
             psk_set_enabled(!psk_enabled()); changed = true;
+        } else if (hit(&B_LORARX, lx, ly)) {
+            /* Same LoRa RX workflow formerly launched from the PLAN menu. */
+            lora_rx_get_config(&s_lr_edit);
+            s_lr_saved = false;
+            lora_rx_enable(true);
+            if (lora_rx_enabled()) {
+                sdr_set_iq_discard(true);
+                audio_set_volume(0);
+                s_menu = 7;
+            } else {
+                s_lora_error_until = xTaskGetTickCount() + pdMS_TO_TICKS(5000);
+            }
+            changed = true;
         } else if (hit(&B_HORUS, lx, ly)) {
             mode_button(DSP_MODE_HORUS);
             changed = true;
@@ -2051,6 +2175,12 @@ static bool handle_touch(void)
 
 static void present(void)
 {
+    /* Keep the web image alive while the LCD backlight is off.
+     * Do not run the LCD PPA/flush while the screensaver is active. */
+    if (s_scr_off) {
+        if (web_mirror_enabled()) web_mirror_publish(LBUF);
+        return;
+    }
     ppa_do_scale_rotate_mirror(s_ppa, &(ppa_srm_oper_config_t){
         .in = { .buffer = LBUF, .pic_w = LW, .pic_h = LH, .block_w = LW, .block_h = LH,
                 .srm_cm = PPA_SRM_COLOR_MODE_RGB565 },
@@ -2060,6 +2190,7 @@ static void present(void)
         .rotation_angle = PPA_SRM_ROTATION_ANGLE_90, .scale_x = SCALE, .scale_y = SCALE,
     });
     bsp_tab5_display_flush(s_fb_index);
+    web_mirror_publish(LBUF);
     s_fb_index ^= 1;
 }
 
@@ -2099,10 +2230,26 @@ static void ui_task(void *arg)
         if (!s_scr_off && SCR_OFF_MS[s_scr_off_i] &&
             pdTICKS_TO_MS(xTaskGetTickCount()) - s_last_touch_ms >= SCR_OFF_MS[s_scr_off_i])
             scr_off_set(true);
-        if (s_scr_off) { vTaskDelay(pdMS_TO_TICKS(50)); continue; } /* dark: nothing to render */
+        if (s_scr_off && !web_mirror_enabled()) { vTaskDelay(pdMS_TO_TICKS(50)); continue; } /* LCD off; render only if web mirror needs frames */
         if (s_menu) { /* an open menu owns the screen; the SDR keeps running underneath */
+            /* A menu may render only once. The web publisher is rate-limited to
+             * 100 ms, so that one render can be skipped. Retry publishing the
+             * same stable LBUF for a short time after a menu change. This does
+             * not redraw the LCD or alter the SDR, and guarantees that the
+             * mirror eventually captures the menu even if the first call was
+             * throttled or its frame mutex was busy. */
+            static int mirror_menu_retry = 0;
             if (s_menu == 7 && lora_aprs_revision()!=last_lora_revision) {last_lora_revision=lora_aprs_revision();dirty=true;}
-            if (dirty) { if (s_menu == 3 || s_menu == 4) rs41_log_draw(); else draw_menu(); present(); }
+            if (dirty) {
+                if (s_menu == 3 || s_menu == 4) rs41_log_draw();
+                else draw_menu();
+                present();
+                mirror_menu_retry = 8;
+            }
+            if (mirror_menu_retry > 0) {
+                web_mirror_publish(LBUF);
+                mirror_menu_retry--;
+            }
             vTaskDelay(pdMS_TO_TICKS(30));
             continue;
         }
