@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 
 #include "esp_log.h"
 #include "ft8/constants.h"
@@ -52,6 +53,7 @@ static const char *TAG = "ft8";
 #define STRIDE      (TIME_OSR * FREQ_OSR * NUM_BINS)
 
 #define SLOT_SAMPLES (15 * SR)            /* 180000                               */
+#define EARLY_BLOCKS 84                   /* focused QSO pass ends ~13.14 s */
 #define WIN_BLOCKS   92                   /* 14.7 s: decode window length         */
 #define PRE_ROLL     3600                 /* locked window starts 0.3 s early     */
 #define W_CAP        200                  /* waterfall blocks kept                */
@@ -279,6 +281,56 @@ typedef struct {
 
 static dec_t s_dec[MAX_DECODED];
 
+/* Focus is written by UI and read by the decoder task. A short seqlock
+ * avoids tearing the selected frequency/callsign between cores. */
+static volatile uint32_t s_focus_seq;
+static char s_focus_call[16];
+static int s_focus_hz;
+
+void ft8_set_qso_focus(const char *call, int audio_hz)
+{
+    __atomic_add_fetch(&s_focus_seq, 1, __ATOMIC_ACQ_REL);
+    if (call && *call && audio_hz >= F_MIN_HZ && audio_hz <= F_MAX_HZ) {
+        copy_str(s_focus_call, sizeof s_focus_call, call);
+        s_focus_hz = audio_hz;
+    } else {
+        s_focus_call[0] = '\0';
+        s_focus_hz = 0;
+    }
+    __atomic_add_fetch(&s_focus_seq, 1, __ATOMIC_RELEASE);
+}
+
+static int focus_snapshot(char *call)
+{
+    for (int tries = 0; tries < 8; ++tries) {
+        uint32_t a = __atomic_load_n(&s_focus_seq, __ATOMIC_ACQUIRE);
+        if (a & 1) continue;
+        int hz = s_focus_hz;
+        memcpy(call, s_focus_call, sizeof s_focus_call);
+        uint32_t b = __atomic_load_n(&s_focus_seq, __ATOMIC_ACQUIRE);
+        if (a == b) return hz;
+    }
+    call[0] = 0;
+    return 0;
+}
+
+static bool text_has_call(const char *msg, const char *call)
+{
+    size_t n = strlen(call);
+    const char *p = msg;
+    while ((p = strstr(p, call)) != NULL) {
+        bool left = (p == msg || p[-1] == ' ' || p[-1] == '<');
+        bool right = (p[n] == 0 || p[n] == ' ' || p[n] == '>');
+        if (left && right) return true;
+        p++;
+    }
+    return false;
+}
+
+static bool is_recent(const dec_t *d);
+static void add_message(const dec_t *d, int64_t boundary, uint16_t slot);
+
+
 static int cmp_f(const void *a, const void *b)
 {
     float x = *(const float *)a, y = *(const float *)b;
@@ -320,7 +372,7 @@ static int estimate_snr(const ftx_waterfall_t *wf, const ftx_candidate_t *c, con
 }
 
 /* Decode blocks [ws, ws+nblk) of the absolute stream. Fills s_dec[], returns count. */
-static int decode_window(int64_t ws, int nblk)
+static int decode_window(int64_t ws, int nblk, int64_t boundary, uint16_t slot, bool focus_only)
 {
     int64_t rel = ws - W_base;
     if (rel < 0 || rel + nblk > W_count) return 0;
@@ -338,14 +390,24 @@ static int decode_window(int64_t ws, int nblk)
 
     static ftx_candidate_t cands[MAX_CANDIDATES];
     int ncand = ftx_find_candidates(&wf, MAX_CANDIDATES, cands, MIN_SCORE);
+    char focus_call[16];
+    int focus_hz = focus_snapshot(focus_call);
+    if (focus_only && (!focus_hz || !focus_call[0])) return 0;
 
     static ftx_message_t decoded[MAX_DECODED];
     static ftx_message_t *dtab[MAX_DECODED];
     memset(dtab, 0, sizeof dtab);
     int ndec = 0;
 
+    /* Decode candidates near the active QSO audio tone first. The early pass
+     * deliberately skips unrelated candidates to minimize turnaround time. */
+    for (int pass = 0; pass < (focus_only ? 1 : 2); ++pass) {
     for (int i = 0; i < ncand && ndec < MAX_DECODED; i++) {
         const ftx_candidate_t *c = &cands[i];
+        float candidate_hz = (MIN_BIN + c->freq_offset + (float)c->freq_sub / FREQ_OSR) / FT8_SYMBOL_PERIOD;
+        bool near = focus_hz && fabsf(candidate_hz - focus_hz) <= 120.0f;
+        if (focus_only && !near) continue;
+        if (!focus_only && (pass == 0 ? !near : near)) continue;
         if ((i & 7) == 7) FT8_YIELD();
         ftx_message_t msg;
         ftx_decode_status_t st;
@@ -377,7 +439,12 @@ static int decode_window(int64_t ws, int nblk)
         float time_sec = (c->time_offset + (float)c->time_sub / TIME_OSR) * FT8_SYMBOL_PERIOD;
         d->start = ws * BLOCK + (int64_t)lroundf((time_sec - FT8_TIME_BIAS) * SR);
         d->snr = estimate_snr(&wf, c, tones);
+        /* Publish focused messages immediately, before decoding other signals.
+         * The normal result publication later suppresses duplicates. */
+        if (boundary > 0 && focus_hz && near && focus_call[0] && text_has_call(d->text, focus_call) && !is_recent(d))
+            add_message(d, boundary, slot);
         ndec++;
+    }
     }
     return ndec;
 }
@@ -388,6 +455,7 @@ static bool s_locked;
 static int64_t s_next_B;     /* absolute sample index of the next slot boundary to decode */
 static uint16_t s_slot_no;
 static int s_empty;
+static bool s_early_done;
 static int64_t s_next_scan;  /* block index at which to try the next scan decode */
 
 /* ---- message list (UI) ------------------------------------------------------------- */
@@ -426,6 +494,23 @@ static void add_message(const dec_t *d, int64_t boundary, uint16_t slot)
     ft8_msg_t *m = &s_msgs[s_msg_total % MSG_N];
     m->seq = s_msg_total + 1;
     m->slot = slot;
+    /* UTC slot of the received signal, inferred from its sample-grid boundary.
+     * Unlike the decoder slot counter, this survives re-locks and early decodes.
+     * s_total_blocks is the current audio sample position; wall time is sampled
+     * at publication, so account for the age of the boundary in the buffer.
+     * Reject bad UTC or a grid more than 2 seconds from a UTC 15 s boundary. */
+    m->utc_slot = 0;
+    struct timeval utc_tv;
+    gettimeofday(&utc_tv, NULL);
+    if (utc_tv.tv_sec >= 1760000000LL && boundary > 0) {
+        int64_t now_us = (int64_t)utc_tv.tv_sec * 1000000LL + utc_tv.tv_usec;
+        int64_t samples_since_boundary = s_total_blocks * (int64_t)BLOCK - boundary;
+        int64_t boundary_us = now_us - samples_since_boundary * 1000000LL / SR;
+        int64_t rounded_slot = (boundary_us + 7500000LL) / 15000000LL;
+        int64_t phase_error = boundary_us - rounded_slot * 15000000LL;
+        if (phase_error >= -2000000LL && phase_error <= 2000000LL && rounded_slot > 0)
+            m->utc_slot = (uint32_t)rounded_slot;
+    }
     m->snr = (int16_t)d->snr;
     m->dt = (float)(d->start - boundary) / SR - 0.5f;
     m->freq = (int16_t)lroundf(d->freq);
@@ -491,6 +576,7 @@ static void soft_reset(void)
     memset(s_last_frame, 0, NFFT * sizeof(float));
     s_locked = false;
     s_empty = 0;
+    s_early_done = false;
     s_next_scan = 0;
     s_next_B = 0;
     s_slot_no = 0;
@@ -511,6 +597,7 @@ static void lock_to(int64_t boundary)
     s_next_B = boundary;
     s_locked = true;
     s_empty = 0;
+    s_early_done = false;
     s_stat.locked = true;
     ESP_LOGI(TAG, "slot phase locked");
 }
@@ -519,7 +606,7 @@ static void do_scan_decode(void)
 {
     if (s_total_blocks - W_base < WIN_BLOCKS + 1) return;
     int64_t ws = s_total_blocks - WIN_BLOCKS;
-    int n = decode_window(ws, WIN_BLOCKS);
+    int n = decode_window(ws, WIN_BLOCKS, 0, s_slot_no, false);
     s_stat.last_count = n;
     if (n <= 0) return;
 
@@ -533,18 +620,26 @@ static void do_scan_decode(void)
         if (!is_recent(&s_dec[i])) add_message(&s_dec[i], est, s_slot_no);
     s_slot_no++;
     lock_to(est + SLOT_SAMPLES);
-    s_stat.slots = 0;
+    /* Keep the public counter in the SAME domain as ft8_msg_t.slot.
+     * Never restart it on phase re-lock: otherwise UI freshness checks fail. */
+    s_stat.slots = s_slot_no;
 }
 
 static void do_locked_decode(void)
 {
     int64_t ws = floor_div(s_next_B - PRE_ROLL, BLOCK);
+    /* Try the active QSO before the entire 14.7 s waterfall is ready. */
+    if (!s_early_done && s_total_blocks >= ws + EARLY_BLOCKS && ws >= W_base) {
+        s_early_done = true;
+        (void)decode_window(ws, EARLY_BLOCKS, s_next_B, s_slot_no, true);
+    }
     if (s_total_blocks < ws + WIN_BLOCKS) return; /* not enough audio yet */
     if (ws < W_base) { /* fell too far behind: skip this slot */
         s_next_B += SLOT_SAMPLES;
+        s_early_done = false;
         return;
     }
-    int n = decode_window(ws, WIN_BLOCKS);
+    int n = decode_window(ws, WIN_BLOCKS, s_next_B, s_slot_no, false);
     s_stat.last_count = n;
     int64_t boundary = s_next_B;
     int added = 0;
@@ -556,8 +651,9 @@ static void do_locked_decode(void)
     }
     hash_cleanup(10);
     s_slot_no++;
-    s_stat.slots++;
+    s_stat.slots = s_slot_no;
     s_next_B += SLOT_SAMPLES;
+    s_early_done = false;
     s_empty = (n > 0) ? 0 : s_empty + 1;
     if (s_empty >= EMPTY_UNLOCK) { /* nothing for a while: the phase may be wrong → scan again */
         s_locked = false;

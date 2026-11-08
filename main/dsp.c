@@ -262,8 +262,16 @@ static void fft_block(void)
         s_fft[2 * i] = ((float)s_blk[2 * i] - 127.4f) * wi;
         s_fft[2 * i + 1] = ((float)s_blk[2 * i + 1] - 127.4f) * wi;
     }
-    dsps_fft2r_fc32(s_fft, FFT_N);
-    dsps_bit_rev_fc32(s_fft, FFT_N);
+    esp_err_t fft_err = dsps_fft2r_fc32(s_fft, FFT_N);
+    if (fft_err != ESP_OK) {
+        ESP_LOGE(TAG, "FFT calculation failed: %d", (int)fft_err);
+        return;
+    }
+    fft_err = dsps_bit_rev_fc32(s_fft, FFT_N);
+    if (fft_err != ESP_OK) {
+        ESP_LOGE(TAG, "FFT bit reversal failed: %d", (int)fft_err);
+        return;
+    }
     for (int k = 0; k < FFT_N; k++) {
         float re = s_fft[2 * k], im = s_fft[2 * k + 1];
         s_acc[k] += re * re + im * im;
@@ -279,8 +287,16 @@ static void fft_lo(void)
         s_fft[2 * i] = s_lo_buf[2 * i] * wi;
         s_fft[2 * i + 1] = s_lo_buf[2 * i + 1] * wi;
     }
-    dsps_fft2r_fc32(s_fft, FFT_N);
-    dsps_bit_rev_fc32(s_fft, FFT_N);
+    esp_err_t fft_err = dsps_fft2r_fc32(s_fft, FFT_N);
+    if (fft_err != ESP_OK) {
+        ESP_LOGE(TAG, "FFT calculation failed: %d", (int)fft_err);
+        return;
+    }
+    fft_err = dsps_bit_rev_fc32(s_fft, FFT_N);
+    if (fft_err != ESP_OK) {
+        ESP_LOGE(TAG, "FFT bit reversal failed: %d", (int)fft_err);
+        return;
+    }
     for (int k = 0; k < FFT_N; k++) {
         float re = s_fft[2 * k], im = s_fft[2 * k + 1];
         s_acc[k] += re * re + im * im;
@@ -346,6 +362,7 @@ static void iq_proc_task(void *arg)
             s_horus_pcm_count = 0;
             s_horus_pcm_peak = 0;
             s_horus_pcm_zero = 0;
+            ESP_LOGI(TAG, "iq_proc stack high-water: %u bytes", (unsigned)uxTaskGetStackHighWaterMark(NULL));
             busy_us = 0; win0 = now;
         }
         if (lora_aprs_enabled()) {
@@ -355,6 +372,13 @@ static void iq_proc_task(void *arg)
             continue;
         }
         size_t n = sdr_read(s_blk + have, sizeof(s_blk) - have);
+        if (n > sizeof(s_blk) - have) {
+            ESP_LOGE(TAG, "sdr_read overflow: n=%u, available=%u", (unsigned)n,
+                     (unsigned)(sizeof(s_blk) - have));
+            have = 0;
+            vTaskDelay(1);
+            continue;
+        }
         have += n;
         if (have < sizeof(s_blk)) {
             if (n == 0) vTaskDelay(1);
@@ -370,11 +394,16 @@ static void iq_proc_task(void *arg)
 
 void dsp_start(void)
 {
-    dsps_fft2r_init_fc32(NULL, FFT_N);
+    esp_err_t err = dsps_fft2r_init_fc32(NULL, FFT_N);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "FFT initialization failed: %d; DSP task not started", (int)err);
+        return;
+    }
     dsps_wind_hann_f32(s_window, FFT_N);
     memset(s_acc, 0, sizeof(s_acc));
     ESP_LOGI(TAG, "demod (WFM/NFM/AM/USB/LSB/CW) + FFT %d starting", FFT_N);
-    xTaskCreatePinnedToCore(iq_proc_task, "iq_proc", 16384, NULL, 12, NULL, 1);
+    BaseType_t created = xTaskCreatePinnedToCore(iq_proc_task, "iq_proc", 16384, NULL, 12, NULL, 1);
+    if (created != pdPASS) ESP_LOGE(TAG, "Failed to create iq_proc task");
 }
 
 int dsp_spectrum_bins(void) { return FFT_N; }

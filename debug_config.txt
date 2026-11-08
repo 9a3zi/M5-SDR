@@ -1,0 +1,179 @@
+Executing action: reconfigure
+Running cmake in directory D:\Electronic\Espressif\projects\M5-SDR\build
+Executing "cmake -G Ninja -DPYTHON_DEPS_CHECKED=1 -DPYTHON=D:\Electronic\Espressif\python_env\idf5.4_py3.11_env\Scripts\python.exe -DESP_PLATFORM=1 -DCCACHE_ENABLE=1 D:\Electronic\Espressif\projects\M5-SDR"...
+-- IDF_TARGET is not set, guessed 'esp32p4' from sdkconfig 'D:/Electronic/Espressif/projects/M5-SDR/sdkconfig'
+-- Found Git: D:/Electronic/Espressif/tools/idf-git/2.44.0/cmd/git.exe (found version "2.44.0.windows.1")
+-- ccache will be used for faster recompilation
+-- The C compiler identification is GNU 14.2.0
+-- The CXX compiler identification is GNU 14.2.0
+-- The ASM compiler identification is GNU
+-- Found assembler: D:/Electronic/Espressif/tools/riscv32-esp-elf/esp-14.2.0_20260121/riscv32-esp-elf/bin/riscv32-esp-elf-gcc.exe
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: D:/Electronic/Espressif/tools/riscv32-esp-elf/esp-14.2.0_20260121/riscv32-esp-elf/bin/riscv32-esp-elf-gcc.exe - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: D:/Electronic/Espressif/tools/riscv32-esp-elf/esp-14.2.0_20260121/riscv32-esp-elf/bin/riscv32-esp-elf-g++.exe - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Building ESP-IDF components for target esp32p4
+NOTICE: Skipping optional dependency: espressif/esp_tinyusb
+NOTICE: 
+Following dependencies have new versions available:
+Dependency "espressif/esp_codec_dev": "1.5.10" -> "1.6.2"
+Dependency "espressif/esp_lcd_touch_gt911": "1.2.0~2" -> "1.2.1"
+Consider running "idf.py update-dependencies" to update your lock file.
+NOTICE: Processing 14 dependencies:
+NOTICE: [1/14] espressif/cmake_utilities (0.5.3)
+NOTICE: [2/14] espressif/eppp_link (1.1.6)
+NOTICE: [3/14] espressif/esp-dsp (1.8.2)
+NOTICE: [4/14] espressif/esp_codec_dev (1.5.10)
+NOTICE: [5/14] espressif/esp_hosted (1.4.0)
+NOTICE: [6/14] espressif/esp_lcd_ili9881c (1.1.0)
+NOTICE: [7/14] espressif/esp_lcd_st7121 (1.0.1)
+NOTICE: [8/14] espressif/esp_lcd_st7123 (1.0.2)
+NOTICE: [9/14] espressif/esp_lcd_touch (1.2.1)
+NOTICE: [10/14] espressif/esp_lcd_touch_gt911 (1.2.0~2)
+NOTICE: [11/14] espressif/esp_lcd_touch_st7123 (1.0.2)
+NOTICE: [12/14] espressif/esp_serial_slave_link (1.1.2)
+NOTICE: [13/14] espressif/esp_wifi_remote (0.8.5)
+NOTICE: [14/14] idf (5.4.4)
+CMake Warning at D:/Electronic/Espressif/frameworks/esp-idf-v5.4.4/tools/cmake/build.cmake:628 (message):
+  
+  D:\Electronic\Espressif\python_env\idf5.4_py3.11_env\Lib\site-packages\pydantic\main.py:475:
+  UserWarning: Pydantic serializer warnings:
+
+    PydanticSerializationUnexpectedValue(Defaulting to left to right union serialization - failed to get discriminator value for tagged union serialization [input_value=DependencyItem(version='>...=None, pre_release=None), input_type=DependencyItem])
+    return self.__pydantic_serializer__.to_python(
+
+  
+  D:\Electronic\Espressif\python_env\idf5.4_py3.11_env\Lib\site-packages\pydantic\main.py:542:
+  UserWarning: Pydantic serializer warnings:
+
+    PydanticSerializationUnexpectedValue(Defaulting to left to right union serialization - failed to get discriminator value for tagged union serialization [input_value=DependencyItem(version='>...=None, pre_release=None), input_type=DependencyItem])
+    return self.__pydantic_serializer__.to_json(
+
+Call Stack (most recent call first):
+  D:/Electronic/Espressif/frameworks/esp-idf-v5.4.4/tools/cmake/project.cmake:722 (idf_build_process)
+  CMakeLists.txt:5 (project)
+
+
+-- Project sdkconfig file D:/Electronic/Espressif/projects/M5-SDR/sdkconfig
+Loading defaults file D:/Electronic/Espressif/projects/M5-SDR/sdkconfig.defaults...
+CMake Warning at D:/Electronic/Espressif/frameworks/esp-idf-v5.4.4/tools/cmake/project.cmake:735 (message):
+  Missing kconfig option.  Re-run the build process...
+Call Stack (most recent call first):
+  CMakeLists.txt:5 (project)
+
+
+NOTICE: Skipping optional dependency: espressif/esp_tinyusb
+NOTICE: 
+Following dependencies have new versions available:
+Dependency "espressif/esp_codec_dev": "1.5.10" -> "1.6.2"
+Dependency "espressif/esp_lcd_touch_gt911": "1.2.0~2" -> "1.2.1"
+Consider running "idf.py update-dependencies" to update your lock file.
+NOTICE: Processing 14 dependencies:
+NOTICE: [1/14] espressif/cmake_utilities (0.5.3)
+NOTICE: [2/14] espressif/eppp_link (1.1.6)
+NOTICE: [3/14] espressif/esp-dsp (1.8.2)
+NOTICE: [4/14] espressif/esp_codec_dev (1.5.10)
+NOTICE: [5/14] espressif/esp_hosted (1.4.0)
+NOTICE: [6/14] espressif/esp_lcd_ili9881c (1.1.0)
+NOTICE: [7/14] espressif/esp_lcd_st7121 (1.0.1)
+NOTICE: [8/14] espressif/esp_lcd_st7123 (1.0.2)
+NOTICE: [9/14] espressif/esp_lcd_touch (1.2.1)
+NOTICE: [10/14] espressif/esp_lcd_touch_gt911 (1.2.0~2)
+NOTICE: [11/14] espressif/esp_lcd_touch_st7123 (1.0.2)
+NOTICE: [12/14] espressif/esp_serial_slave_link (1.1.2)
+NOTICE: [13/14] espressif/esp_wifi_remote (0.8.5)
+NOTICE: [14/14] idf (5.4.4)
+CMake Warning at D:/Electronic/Espressif/frameworks/esp-idf-v5.4.4/tools/cmake/build.cmake:628 (message):
+  
+  D:\Electronic\Espressif\python_env\idf5.4_py3.11_env\Lib\site-packages\pydantic\main.py:475:
+  UserWarning: Pydantic serializer warnings:
+
+    PydanticSerializationUnexpectedValue(Defaulting to left to right union serialization - failed to get discriminator value for tagged union serialization [input_value=DependencyItem(version='>...=None, pre_release=None), input_type=DependencyItem])
+    return self.__pydantic_serializer__.to_python(
+
+  
+  D:\Electronic\Espressif\python_env\idf5.4_py3.11_env\Lib\site-packages\pydantic\main.py:542:
+  UserWarning: Pydantic serializer warnings:
+
+    PydanticSerializationUnexpectedValue(Defaulting to left to right union serialization - failed to get discriminator value for tagged union serialization [input_value=DependencyItem(version='>...=None, pre_release=None), input_type=DependencyItem])
+    return self.__pydantic_serializer__.to_json(
+
+Call Stack (most recent call first):
+  D:/Electronic/Espressif/frameworks/esp-idf-v5.4.4/tools/cmake/project.cmake:722 (idf_build_process)
+  CMakeLists.txt:5 (project)
+
+
+-- Project sdkconfig file D:/Electronic/Espressif/projects/M5-SDR/sdkconfig
+Loading defaults file D:/Electronic/Espressif/projects/M5-SDR/sdkconfig.defaults...
+CMake Warning at D:/Electronic/Espressif/frameworks/esp-idf-v5.4.4/tools/cmake/project.cmake:735 (message):
+  Missing kconfig option.  Re-run the build process...
+Call Stack (most recent call first):
+  CMakeLists.txt:5 (project)
+
+
+NOTICE: Skipping optional dependency: espressif/esp_tinyusb
+NOTICE: 
+Following dependencies have new versions available:
+Dependency "espressif/esp_codec_dev": "1.5.10" -> "1.6.2"
+Dependency "espressif/esp_lcd_touch_gt911": "1.2.0~2" -> "1.2.1"
+Consider running "idf.py update-dependencies" to update your lock file.
+NOTICE: Processing 14 dependencies:
+NOTICE: [1/14] espressif/cmake_utilities (0.5.3)
+NOTICE: [2/14] espressif/eppp_link (1.1.6)
+NOTICE: [3/14] espressif/esp-dsp (1.8.2)
+NOTICE: [4/14] espressif/esp_codec_dev (1.5.10)
+NOTICE: [5/14] espressif/esp_hosted (1.4.0)
+NOTICE: [6/14] espressif/esp_lcd_ili9881c (1.1.0)
+NOTICE: [7/14] espressif/esp_lcd_st7121 (1.0.1)
+NOTICE: [8/14] espressif/esp_lcd_st7123 (1.0.2)
+NOTICE: [9/14] espressif/esp_lcd_touch (1.2.1)
+NOTICE: [10/14] espressif/esp_lcd_touch_gt911 (1.2.0~2)
+NOTICE: [11/14] espressif/esp_lcd_touch_st7123 (1.0.2)
+NOTICE: [12/14] espressif/esp_serial_slave_link (1.1.2)
+NOTICE: [13/14] espressif/esp_wifi_remote (0.8.5)
+NOTICE: [14/14] idf (5.4.4)
+CMake Warning at D:/Electronic/Espressif/frameworks/esp-idf-v5.4.4/tools/cmake/build.cmake:628 (message):
+  
+  D:\Electronic\Espressif\python_env\idf5.4_py3.11_env\Lib\site-packages\pydantic\main.py:475:
+  UserWarning: Pydantic serializer warnings:
+
+    PydanticSerializationUnexpectedValue(Defaulting to left to right union serialization - failed to get discriminator value for tagged union serialization [input_value=DependencyItem(version='>...=None, pre_release=None), input_type=DependencyItem])
+    return self.__pydantic_serializer__.to_python(
+
+  
+  D:\Electronic\Espressif\python_env\idf5.4_py3.11_env\Lib\site-packages\pydantic\main.py:542:
+  UserWarning: Pydantic serializer warnings:
+
+    PydanticSerializationUnexpectedValue(Defaulting to left to right union serialization - failed to get discriminator value for tagged union serialization [input_value=DependencyItem(version='>...=None, pre_release=None), input_type=DependencyItem])
+    return self.__pydantic_serializer__.to_json(
+
+  WARNING: The following Kconfig variables were used in "if" clauses, but not
+  found in any Kconfig file:
+
+      ESP_HOSTED_HOST_USB_CDC_ACM_MANIFEST, introduced by espressif/usb_host_cdc_acm, defined in (unknown)
+      ESP_HOSTED_HOST_USB_CHERRYUSB_MANIFEST, introduced by cherry-embedded/cherryusb, defined in (unknown)
+      ESP_HOSTED_HOST_USB_RNDIS_MANIFEST, introduced by espressif/iot_usbh_rndis, defined in (unknown)
+
+  
+
+Call Stack (most recent call first):
+  D:/Electronic/Espressif/frameworks/esp-idf-v5.4.4/tools/cmake/project.cmake:722 (idf_build_process)
+  CMakeLists.txt:5 (project)
+
+
+-- Project sdkconfig file D:/Electronic/Espressif/projects/M5-SDR/sdkconfig
+Loading defaults file D:/Electronic/Espressif/projects/M5-SDR/sdkconfig.defaults...
+CMake Error at D:/Electronic/Espressif/frameworks/esp-idf-v5.4.4/tools/cmake/project.cmake:738 (message):
+  Missing required kconfig option after retry.
+Call Stack (most recent call first):
+  CMakeLists.txt:5 (project)
+
+
+-- Configuring incomplete, errors occurred!
+cmake failed with exit code 1, output of the command is in the D:\Electronic\Espressif\projects\M5-SDR\build\log\idf_py_stderr_output_6212 and D:\Electronic\Espressif\projects\M5-SDR\build\log\idf_py_stdout_output_6212

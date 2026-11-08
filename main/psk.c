@@ -25,6 +25,7 @@
 #include "nvs.h"
 
 #include "net_cfg.h"
+#include "station_settings.h"
 #include "wifi_net.h"
 
 static const char *TAG = "psk";
@@ -244,8 +245,10 @@ static size_t build_dgram(uint8_t *buf, int max_spots)
     {
         uint8_t *rec = p;
         p += 4; /* set id + length */
-        p = put_str(p, PSK_CALLSIGN);
-        p = put_str(p, PSK_GRID);
+        station_settings_t st;
+        station_settings_get(&st);
+        p = put_str(p, st.callsign);
+        p = put_str(p, st.grid);
         p = put_str(p, PSK_SW_NAME);
         p = put_str(p, PSK_RIG);
         size_t plen = (size_t)(p - rec);

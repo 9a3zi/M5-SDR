@@ -7,6 +7,7 @@
 #include "bsp_common.h"
 #include "esp_lcd_touch.h"
 #include "esp_codec_dev.h"
+#include "driver/i2c_master.h"
 
 typedef struct {
     struct {
@@ -34,3 +35,5 @@ void *bsp_tab5_display_get_frame_buffer(int fb_index);
 void bsp_tab5_display_flush(int fb_index);
 int bsp_tab5_touch_read(esp_lcd_touch_point_data_t *points, uint8_t max_points);
 void bsp_tab5_touch_wait_interrupt(void);
+// Return existing Tab5 I2C0 bus handle
+i2c_master_bus_handle_t bsp_tab5_get_i2c_bus(void);

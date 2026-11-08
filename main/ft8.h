@@ -24,7 +24,8 @@ extern "C" {
 
 typedef struct {
     uint32_t seq;        /* increments per decoded message                 */
-    uint16_t slot;       /* slot counter (since lock), wraps               */
+    uint16_t slot;       /* decoder slot counter (same epoch as status.slots), wraps               */
+    uint32_t utc_slot;   /* actual RX UTC 15 s slot, 0 when not verified */
     int16_t snr;         /* approximate SNR in 2500 Hz, dB                 */
     float dt;            /* time offset vs. the slot grid, s (nominal 0)   */
     int16_t freq;        /* audio frequency of tone 0, Hz                  */
@@ -34,7 +35,7 @@ typedef struct {
 typedef struct {
     bool locked;         /* slot phase known                               */
     float slot_pos;      /* seconds into the current slot (valid if locked) */
-    uint32_t slots;      /* slots decoded since lock                       */
+    uint32_t slots;      /* next decoder slot ID; same epoch as msg.slot                       */
     uint32_t total;      /* messages decoded since entering FT8 mode       */
     int last_count;      /* messages decoded in the last attempt           */
 } ft8_status_t;
@@ -44,6 +45,10 @@ void ft8_start(void);
 
 /* Forget everything (call when entering FT8 mode). Safe from any task. */
 void ft8_reset(void);
+
+/* Prioritize FT8 decoding around the selected QSO audio frequency.
+ * Pass NULL or 0 to return to normal all-station decoding. */
+void ft8_set_qso_focus(const char *callsign, int audio_hz);
 
 /* One 48 kHz audio sample (any scale; normalised internally). Called by the
  * DSP task; cheap. */

@@ -32,6 +32,10 @@ static const char *TAG = "BSP_TAB5";
 
 #define I2C0_PORT_NUM (0)
 static i2c_master_bus_handle_t i2c0;
+i2c_master_bus_handle_t bsp_tab5_get_i2c_bus(void)
+{
+    return i2c0;
+}
 static pi4io_t pi4ioe1, pi4ioe2;
 
 typedef enum {

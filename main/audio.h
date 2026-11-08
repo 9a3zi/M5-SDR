@@ -27,6 +27,17 @@ void audio_play(const int16_t *mono, int n);
 /* Output volume, 0..100. */
 void audio_set_volume(int vol);
 
+/* Nonblocking UI touch confirmation tone, mixed by audio output task. */
+void audio_touch_beep(void);
+
+/* TX monitor: mute RTL-SDR audio while TX is active; tone = 1500 + symbol*6.25 Hz. */
+void audio_ft8_tx_monitor_start(void);
+void audio_ft8_tx_monitor_symbol(uint8_t symbol);
+void audio_ft8_tx_monitor_stop(void);
+/* TX monitor digital amplitude, 0..100 percent, independent of RX volume. */
+void audio_ft8_tx_monitor_set_volume(int percent);
+int audio_ft8_tx_monitor_get_volume(void);
+
 #ifdef __cplusplus
 }
 #endif
