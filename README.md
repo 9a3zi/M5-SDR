@@ -2,7 +2,7 @@
 
 **Standalone SDR receiver, digital-mode decoder and experimental FT8 transceiver controller for the M5Stack Tab5 (ESP32-P4).**
 ![ft8 rcv example](images/IMG_20261102_210143(2).jpg)
-M5-SDR turns the **M5Stack Tab5** into a portable software-defined radio receiver with a live FFT spectrum, scrolling waterfall, touchscreen tuning, 
+M5-SDR turns the **M5Stack Tab5** into a portable software-defined radio receiver and FT8 transceiver with a live FFT spectrum, scrolling waterfall, touchscreen tuning, 
 demodulated audio through the built-in speaker, and several digital-mode decoders. **No PC is required during operation.** Connect a compatible 
 RTL-SDR dongle to the Tab5 USB-A host port and start receiving.
 
