@@ -109,7 +109,7 @@ static void cpu_temp_sample(void)
 #define FREQ_MAX 1766000000u
 
 /* Drag tuning: full canvas width ≈ 100 MHz (fast band scanning). */
-#define DRAG_HZ_PER_PX (10000000 / LW)
+#define DRAG_HZ_PER_PX (10000 / LW) // 7 nula za 10Mhz
 #define ZOOM_MIN_HZ 10000u /* visual zoom only; DSP sample rate is unchanged */
 
 #define SQ_OFFSET 64.0f
@@ -130,7 +130,24 @@ static void cpu_temp_sample(void)
 /* Startup splash: full-screen welcome banner shown for a few seconds after
  * boot. Edit the callsign/text to your own. */
 #define SPLASH_TITLE "M5-SDR"
-#define SPLASH_CALL  "9A3ZI"
+/* Shared station identity: SETTINGS / NVS is the single source of truth. */
+static station_settings_t s_station;
+static bool s_station_loaded;
+static void station_identity_reload(void)
+{
+    station_settings_get(&s_station);
+    s_station_loaded = true;
+}
+static const char *station_call(void)
+{
+    if (!s_station_loaded) station_identity_reload();
+    return s_station.callsign;
+}
+static const char *station_grid(void)
+{
+    if (!s_station_loaded) station_identity_reload();
+    return s_station.grid;
+}
 #define SPLASH_MS    2500
 
 static uint16_t *LBUF;
@@ -569,13 +586,22 @@ static void panel_separators(void)
 /* FT8 QSO: manual and opt-in automatic sequencing. */
 static ft8_msg_t s_qso_selected;
 static bool s_qso_has_selected = false;
+static bool s_cq_active = false;
+/* Optional continuous CQ after each completed AUTO QSO. */
+static bool s_auto_cq = false;
+static int s_cq_tx_parity = 0; /* EVEN UTC 15-second slots */
+static int64_t s_cq_last_queued_slot = -1;
+static uint32_t s_cq_last_rx_seq = 0;
+static char s_cq_debug[76] = "WAIT RX";
+static uint32_t s_cq_seen_count = 0;
+static bool s_qso_wait_cq = false; /* non-CQ selection: RX monitor until fresh CQ */
 static char s_qso_call[16];
 static int s_menu;
 static char s_qso_preview[48];
 static int s_qso_step = 0;
 static bool s_qso_error = false;
 static const char *s_qso_steps[] = {"CALL", "REPORT", "R-RPT", "RR73", "73"};
-/* User preference defaults ON at each boot; only AUTO button or STOP turns it OFF. */
+/* Automatically arm AUTO SEQ for each newly selected CQ; STOP cancels only current QSO. */
 static bool s_auto_enabled = true;
 static bool s_auto = false;
 static bool s_auto_done = false;
@@ -593,6 +619,36 @@ static char s_qso_rst_sent[8] = "";
 static char s_qso_rst_rcvd[8] = "";
 static time_t s_qso_start_utc = 0;
 static uint64_t s_qso_rf_base_chz = 0;
+/* True only when this QSO started with our own CQ: keep TX at 1500 Hz. */
+static bool s_qso_own_cq = false;
+/* User-adjustable audio offset for our CQ and replies to our own CQ. */
+#define CQ_TX_AUDIO_MIN 200
+#define CQ_TX_AUDIO_MAX 3000
+#define CQ_TX_AUDIO_STEP 50
+static uint32_t s_cq_tx_audio_hz = 1500;
+
+static void cq_tx_audio_load(void)
+{
+    nvs_handle_t nvs;
+    if (nvs_open("ui", NVS_READONLY, &nvs) == ESP_OK) {
+        uint32_t value = 0;
+        if (nvs_get_u32(nvs, "cqtxhz", &value) == ESP_OK &&
+            value >= CQ_TX_AUDIO_MIN && value <= CQ_TX_AUDIO_MAX)
+            s_cq_tx_audio_hz = value;
+        nvs_close(nvs);
+    }
+}
+
+static void cq_tx_audio_save(void)
+{
+    nvs_handle_t nvs;
+    if (nvs_open("ui", NVS_READWRITE, &nvs) == ESP_OK) {
+        if (nvs_set_u32(nvs, "cqtxhz", s_cq_tx_audio_hz) == ESP_OK)
+            (void)nvs_commit(nvs);
+        nvs_close(nvs);
+    }
+}
+
 /* FT8 TX monitor volume slider, independent of receiver volume. */
 #define TX_MON_X 344
 #define TX_MON_W 160
@@ -670,7 +726,7 @@ static void qso_history_add(const char *message, bool tx, int snr)
 
 static bool qso_history_rx_tick(void)
 {
-    if (!s_qso_has_selected || s_mode != DSP_MODE_FT8) return false;
+    if ((!s_qso_has_selected && !s_cq_active) || s_mode != DSP_MODE_FT8) return false;
     ft8_msg_t msgs[24];
     ft8_status_t st;
     int n = ft8_get_messages(msgs, 24, &st);
@@ -681,12 +737,29 @@ static bool qso_history_rx_tick(void)
         s_qso_history_last_seq = m->seq;
         char a[20] = "", b[20] = "", c[20] = "";
         if (sscanf(m->text, "%19s %19s %19s", a, b, c) < 2) continue;
-        bool from_station = (!strcmp(a, "CQ") &&
+        /* Monitor the selected callsign regardless of its QSO partner.
+         * The second token is the transmitting station in a directed FT8
+         * message; for CQ it is the second token (or third for CQ DX).
+         * Keep this independent of AUTO SEQ, including when AUTO is OFF. */
+        bool from_station = s_qso_has_selected && ((!strcmp(a, "CQ") &&
                             (!strcmp(b, s_qso_call) || !strcmp(c, s_qso_call))) ||
-                            (!strcmp(a, "9A3ZI") && !strcmp(b, s_qso_call)) ||
-                            (!strcmp(a, s_qso_call) && !strcmp(b, "9A3ZI"));
+                            (strcmp(a, "CQ") && !strcmp(b, s_qso_call)));
         if (!from_station) continue;
         qso_history_add(m->text, false, m->snr);
+        /* While listening manually, a fresh CQ provides a valid TX slot
+         * for a later manual SEND / AUTO ARM. Never transmit on detection. */
+        if (s_qso_has_selected && !s_auto && !strcmp(a, "CQ") && m->utc_slot) {
+            struct timeval tv;
+            gettimeofday(&tv, NULL);
+            int64_t age = (int64_t)tv.tv_sec / 15 - (int64_t)m->utc_slot;
+            if (tv.tv_sec >= 1760000000LL && age >= 0 && age <= 2) {
+                s_qso_selected = *m;
+                s_qso_wait_cq = false;
+                s_auto_tx_parity = (int)((m->utc_slot + 1u) & 1u);
+                snprintf(s_auto_status, sizeof s_auto_status,
+                         "CQ RECEIVED - MONITOR / READY TO ARM");
+            }
+        }
         changed = true;
     }
     /* Record a TX only after the Si5351 worker has actually begun the frame. */
@@ -747,10 +820,11 @@ static void qso_log_adif(void)
     strftime(de, sizeof de, "%Y%m%d", &tm_end);
     strftime(te, sizeof te, "%H%M%S", &tm_end);
     snprintf(freq, sizeof freq, "%.6f", (double)s_qso_rf_base_chz / 100000000.0);
-    fprintf(f, "<CALL:%u>%s <STATION_CALLSIGN:5>9A3ZI <MODE:3>FT8 "
+    fprintf(f, "<CALL:%u>%s <STATION_CALLSIGN:%u>%s <MODE:3>FT8 "
             "<QSO_DATE:8>%s <TIME_ON:6>%s <QSO_DATE_OFF:8>%s <TIME_OFF:6>%s "
             "<FREQ:%u>%s <RST_SENT:%u>%s <RST_RCVD:%u>%s <EOR>\n",
-            (unsigned)strlen(s_qso_call), s_qso_call, d, t, de, te,
+            (unsigned)strlen(s_qso_call), s_qso_call,
+            (unsigned)strlen(station_call()), station_call(), d, t, de, te,
             (unsigned)strlen(freq), freq,
             (unsigned)strlen(s_qso_rst_sent), s_qso_rst_sent,
             (unsigned)strlen(s_qso_rst_rcvd), s_qso_rst_rcvd);
@@ -967,10 +1041,10 @@ static bool qso_extract_call(const char *message, char *call, size_t cap)
     const char *candidate = NULL;
     if (n >= 2 && strcmp(a, "CQ") == 0) {
         candidate = (strcmp(b, "DX") == 0 && n >= 3) ? c : b;
-    } else if (n >= 2 && strcmp(a, "9A3ZI") == 0) {
+    } else if (n >= 2) {
+        /* Directed FT8 message: TO FROM REPORT/GRID. Monitor the sender,
+         * even when the message is addressed to another station. */
         candidate = b;
-    } else if (n >= 2 && strcmp(b, "9A3ZI") == 0) {
-        candidate = a;
     }
     if (!candidate || !strpbrk(candidate, "0123456789") ||
         !strpbrk(candidate, "ABCDEFGHIJKLMNOPQRSTUVWXYZ") ||
@@ -982,26 +1056,27 @@ static bool qso_extract_call(const char *message, char *call, size_t cap)
 static void qso_prepare(void)
 {
     char extra[16];
-    if (s_qso_step == 0) snprintf(extra, sizeof extra, "JN86");
+    if (s_qso_step == 0) snprintf(extra, sizeof extra, "%s", station_grid());
     else if (s_qso_step == 1) snprintf(extra, sizeof extra, "%+03d", (int)s_qso_selected.snr);
     else if (s_qso_step == 2) snprintf(extra, sizeof extra, "R%+03d", (int)s_qso_selected.snr);
     else if (s_qso_step == 3) snprintf(extra, sizeof extra, "RR73");
     else snprintf(extra, sizeof extra, "73");
-    snprintf(s_qso_preview, sizeof s_qso_preview, "%s 9A3ZI %s", s_qso_call, extra);
+    snprintf(s_qso_preview, sizeof s_qso_preview, "%s %s %s", s_qso_call, station_call(), extra);
 }
-/* Transmit on the selected station's decoded FT8 audio frequency.
- * The Si5351 base is the lowest of the eight FT8 tones. Keep the RTL-SDR
- * receive dial unchanged. Called only while TX is idle, never mid-frame. */
+/* Own CQ answered: hold TX at 1500 Hz. Answering someone else: TX follows
+ * their decoded audio frequency. RX dial stays unchanged; only retune idle TX. */
 static esp_err_t qso_sync_tx_frequency(void)
 {
     if (si5351_tone_test_running()) return ESP_ERR_INVALID_STATE;
-    if (!s_qso_selected.seq || s_qso_selected.freq < 100 || s_qso_selected.freq > 3500)
+    if (!s_qso_own_cq && (!s_qso_selected.seq ||
+        s_qso_selected.freq < 100 || s_qso_selected.freq > 3500))
         return ESP_ERR_INVALID_ARG;
-    uint64_t base_chz = ((uint64_t)s_center + (uint64_t)s_qso_selected.freq) * 100ULL;
+    uint32_t tx_audio_hz = s_qso_own_cq ? s_cq_tx_audio_hz : (uint32_t)s_qso_selected.freq;
+    uint64_t base_chz = ((uint64_t)s_center + tx_audio_hz) * 100ULL;
     esp_err_t err = si5351_ft8_set_base_cHz(base_chz);
     if (err == ESP_OK) s_qso_rf_base_chz = base_chz;
     else ESP_LOGE(TAG, "FT8 TX frequency sync failed: dial %lu Hz, tone %d Hz: %s",
-                  (unsigned long)s_center, (int)s_qso_selected.freq, esp_err_to_name(err));
+                  (unsigned long)s_center, (int)tx_audio_hz, esp_err_to_name(err));
     return err;
 }
 
@@ -1015,6 +1090,27 @@ static bool qso_ready_for_new_station(void)
            !si5351_relay_is_tx());
 }
 
+/* FT8 display filter only: decoding and AUTO SEQ remain unchanged. */
+static bool s_ft8_cq_only = false;
+
+static bool ft8_is_cq_message(const char *msg)
+{
+    return msg && !strncmp(msg, "CQ ", 3);
+}
+
+/* Return displayed messages oldest-first, with the same order as the panel. */
+static int ft8_visible_messages(ft8_msg_t *out, int capacity, ft8_status_t *st)
+{
+    ft8_msg_t all[PANEL_COLS * PANEL_ROWS];
+    int n = ft8_get_messages(all, PANEL_COLS * PANEL_ROWS, st);
+    int count = 0;
+    for (int i = 0; i < n; ++i) {
+        if (s_ft8_cq_only && !ft8_is_cq_message(all[i].text)) continue;
+        if (count < capacity) out[count++] = all[i];
+    }
+    return count;
+}
+
 static bool qso_select_panel_row(int x, int y)
 {
     /* Wider hit target horizontally; preserve 8 independently selectable rows. */
@@ -1025,7 +1121,7 @@ static bool qso_select_panel_row(int x, int y)
     int k = col * PANEL_ROWS + row;
     ft8_msg_t msgs[PANEL_COLS * PANEL_ROWS];
     ft8_status_t st;
-    int n = ft8_get_messages(msgs, PANEL_COLS * PANEL_ROWS, &st);
+    int n = ft8_visible_messages(msgs, PANEL_COLS * PANEL_ROWS, &st);
     if (k >= n) return false;
     const ft8_msg_t *m = &msgs[n - 1 - k];
     char call[sizeof s_qso_call];
@@ -1038,6 +1134,9 @@ static bool qso_select_panel_row(int x, int y)
     if (s_qso_has_selected && !qso_ready_for_new_station() &&
         (s_auto || si5351_tone_test_running()))
         return false;
+    if (s_cq_active && si5351_tone_test_running()) return false;
+    s_cq_active = false; /* Selecting a station stops repeated CQ calls. */
+    s_qso_own_cq = false; /* Answering another CQ follows their audio frequency. */
     s_qso_selected = *m;
     ft8_set_qso_focus(call, (int)m->freq);
     snprintf(s_qso_call, sizeof s_qso_call, "%s", call);
@@ -1049,7 +1148,11 @@ static bool qso_select_panel_row(int x, int y)
     qso_history_add(m->text, false, m->snr);
     s_qso_step = 0;
     s_qso_error = false;
-    s_auto = s_auto_enabled;
+    /* A non-CQ message is for monitoring only. Never auto-transmit into
+     * somebody else's QSO, even if AUTO SEQ was previously enabled. */
+    bool selected_cq = !strncmp(m->text, "CQ ", 3);
+    s_qso_wait_cq = !selected_cq;
+    s_auto = selected_cq && s_auto_enabled;
     s_auto_done = false;
     s_auto_logged = false;
     s_auto_final_queued = false;
@@ -1074,13 +1177,15 @@ static bool qso_select_panel_row(int x, int y)
                  call, (unsigned long)m->utc_slot, (long long)rx_age);
     }
     s_auto_last_queued_slot = -1;
-    s_auto_fast_first = s_auto && s_auto_tx_parity >= 0;
+    s_auto_fast_first = selected_cq && s_auto && s_auto_tx_parity >= 0;
     s_auto_last_seq = m->seq;
     s_qso_rst_sent[0] = s_qso_rst_rcvd[0] = 0;
     s_qso_start_utc = 0;
-    s_qso_error = (qso_sync_tx_frequency() != ESP_OK);
+    /* Tuning the TX generator is unnecessary while merely monitoring. */
+    s_qso_error = s_auto && (qso_sync_tx_frequency() != ESP_OK);
     snprintf(s_auto_status, sizeof s_auto_status, "%s",
-             s_auto ? (s_auto_tx_parity < 0 ? "AUTO WAIT - SELECT FRESH CQ" : "AUTO ARMED - WAIT TX SLOT") : "MANUAL");
+             s_auto ? (s_auto_tx_parity < 0 ? "AUTO WAIT - SELECT FRESH CQ" : "AUTO ARMED - WAIT TX SLOT") :
+             (selected_cq ? "MONITORING CQ - AUTO OFF" : "MONITORING - WAIT FOR CQ"));
     qso_prepare();
     s_qso_has_selected = true;
     return true;
@@ -1102,6 +1207,25 @@ static bool qso_auto_tick(void)
             s_auto_done = true;
             s_auto = false;
             qso_log_adif();
+            if (s_auto_cq) {
+                /* RF is idle: resume normal CQ scheduling on the original
+                 * parity. The CQ worker will wait for the next valid slot. */
+                s_cq_active = true;
+                s_qso_own_cq = false;
+                s_cq_last_queued_slot = -1;
+                s_cq_seen_count = 0;
+                s_cq_last_rx_seq = s_auto_last_seq;
+                s_qso_has_selected = false;
+                s_qso_call[0] = 0;
+                s_qso_history_n = 0;
+                s_qso_history_last_seq = 0;
+                s_qso_tx_pending = false;
+                s_qso_tx_step = -1;
+                s_auto_fast_first = false;
+                ft8_set_qso_focus(NULL, 0);
+                snprintf(s_cq_debug, sizeof s_cq_debug, "AUTO CQ - WAIT NEXT TX SLOT");
+                snprintf(s_auto_status, sizeof s_auto_status, "QSO DONE - AUTO CQ RESUMED");
+            }
             return true;
         }
         if (!s_auto_final_started && !si5351_tone_test_running()) {
@@ -1121,8 +1245,9 @@ static bool qso_auto_tick(void)
         s_auto_last_seq = m->seq;
         char to[20] = "", from[20] = "", extra[20] = "";
         if (sscanf(m->text, "%19s %19s %19s", to, from, extra) != 3) continue;
-        if (strcmp(to, "9A3ZI") || strcmp(from, s_qso_call)) continue;
-        s_qso_selected = *m;
+        if (strcmp(to, station_call()) || strcmp(from, s_qso_call)) {
+            continue;
+        }
         ft8_set_qso_focus(s_qso_call, (int)m->freq);
         changed = true;
         if (qso_is_report(extra)) {
@@ -1133,7 +1258,6 @@ static bool qso_auto_tick(void)
                 s_qso_step = 2; /* received report: reply R-report */
             }
             s_auto_attempts = 0;
-            qso_prepare();
             snprintf(s_auto_status, sizeof s_auto_status, "RX %s - NEXT %s", extra, s_qso_steps[s_qso_step]);
         } else if (!strcmp(extra, "RR73") || !strcmp(extra, "73")) {
             /* Acknowledgement received: we still owe the other station 73.
@@ -1141,7 +1265,6 @@ static bool qso_auto_tick(void)
             if (s_qso_step != 4) {
                 s_qso_step = 4;
                 s_auto_attempts = 0;
-                qso_prepare();
                 snprintf(s_auto_status, sizeof s_auto_status, "RX %s - FINAL 73 NEXT", extra);
             }
         } else if (s_qso_step == 0) {
@@ -1149,6 +1272,10 @@ static bool qso_auto_tick(void)
             snprintf(s_auto_status, sizeof s_auto_status, "RX GRID - WAIT REPORT");
         }
     }
+    /* Rebuild the actual TX message after a decoded reply changes the
+     * QSO step.  Without this, the UI highlights RR73/R-RPT while the
+     * Si5351 encoder keeps transmitting the previous REPORT packet. */
+    if (changed) qso_prepare();
     if (!s_auto) return changed;
     if (si5351_tone_test_running()) return changed;
     struct timeval tv;
@@ -1166,22 +1293,27 @@ static bool qso_auto_tick(void)
                  "AUTO WAIT: TX SLOT UNKNOWN - SELECT FRESH CQ");
         return changed;
     }
-    /* First CQ tap: arm immediately when already inside the correct TX
-     * slot. The Si5351 worker permits a bounded late start (<= 1 s).
-     * All later AUTO transmissions retain the proven pre-slot scheduling. */
-    bool fast_first = s_auto_fast_first &&
-                      (slot & 1LL) == s_auto_tx_parity &&
-                      sec_in_slot == 0 && tv.tv_usec <= 750000;
-    if (!fast_first) {
-        if (((slot + 1) & 1LL) != s_auto_tx_parity) return changed;
-        if (sec_in_slot < 13 || (sec_in_slot == 13 && tv.tv_usec < 650000)) return changed;
-        if (sec_in_slot >= 14 && tv.tv_usec >= 700000) return changed;
-    }
-    int64_t next_tx_slot = fast_first ? slot : slot + 1;
-    if ((next_tx_slot & 1LL) != s_auto_tx_parity) next_tx_slot++;
+    /* All AUTO QSO steps may use the current parity-matched TX slot
+     * when decoding finishes just after its boundary. */
+    /* FAST AUTO SEQ for every QSO step, not just the first CQ reply.
+     * The Si5351 worker enforces the actual <=1 s late-start limit.
+     * Queue only if there is still time to encode and prepare the relay. */
+    /* FT8 decoding completes near the END of the peer's RX slot.
+     * Never queue a repeat early in that RX slot: the previous message
+     * may still be awaiting its decoded reply. Instead queue at the
+     * beginning of OUR TX slot, after the decoder had the whole RX slot.
+     * Si5351 allows a safe <=1 s fast start on the current parity. */
+    /* A CQ may already be on air when a delayed decoder result arrives.
+     * After cq_tick() stops that CQ, allow its replacement QSO message
+     * in the SAME TX slot, provided we are still within the 1 s window.
+     * The Si5351 worker makes the final timing decision. */
+    bool fast_first = (slot & 1LL) == s_auto_tx_parity &&
+                      sec_in_slot == 0 && tv.tv_usec < 1000000;
+    if (!fast_first) return changed;
+    int64_t next_tx_slot = slot;
     if (s_auto_last_queued_slot == next_tx_slot) return changed;
-    if (s_auto_attempts >= 3) {
-        qso_auto_off("AUTO STOP: NO RESPONSE AFTER 3 TX");
+    if (s_auto_attempts >= 5) {
+        qso_auto_off("AUTO STOP: NO RESPONSE AFTER 5 TX");
         return true;
     }
     char to[16], from[16], extra[16];
@@ -1207,8 +1339,143 @@ static bool qso_auto_tick(void)
     s_auto_last_queued_slot = next_tx_slot;
     s_auto_fast_first = false;
     s_auto_attempts++;
-    snprintf(s_auto_status, sizeof s_auto_status, "%s %s %d/3",
+    snprintf(s_auto_status, sizeof s_auto_status, "%s %s %d/5",
              fast_first ? "FAST TX" : "AUTO TX", s_qso_steps[s_qso_step], s_auto_attempts);
+    return true;
+}
+
+/* CQ calls use the existing FT8 encoder and TX worker. The first fresh,
+ * directed reply from the opposite RX slot starts an automatic QSO. */
+static bool cq_tick(void)
+{
+    if (!s_cq_active || s_mode != DSP_MODE_FT8) return false;
+    bool changed = false;
+    static bool reply_pending = false;
+    static ft8_msg_t pending_reply;
+    ft8_msg_t msgs[24];
+    ft8_status_t st;
+    int n = ft8_get_messages(msgs, 24, &st);
+    for (int i = 0; i < n && !reply_pending; ++i) {
+        const ft8_msg_t *m = &msgs[i];
+        if (m->seq <= s_cq_last_rx_seq) continue;
+        s_cq_last_rx_seq = m->seq;
+        s_cq_seen_count++;
+        snprintf(s_cq_debug, sizeof s_cq_debug, "RX %lu: %.52s", (unsigned long)s_cq_seen_count, m->text);
+        /* A directed FT8 reply is TO FROM [GRID/REPORT].
+         * Accept the first NEW decoded message addressed to our callsign.
+         * Do not require a particular third field or a validated utc_slot:
+         * FT8 decoder publication can lag and utc_slot may be zero. */
+        char to[20] = "", from[20] = "", extra[20] = "";
+        if (sscanf(m->text, "%19s %19s %19s", to, from, extra) < 2) continue;
+        if (strcmp(to, station_call()) != 0 || strcmp(from, station_call()) == 0 ||
+            strcmp(from, "CQ") == 0) continue;
+        if (s_cq_last_queued_slot < 0) continue; /* No CQ queued yet. */
+        char call[sizeof s_qso_call];
+        if (!qso_extract_call(m->text, call, sizeof call) || strcmp(call, from)) continue;
+        /* Latch the reply even if a CQ TX is queued or active. */
+        snprintf(s_cq_debug, sizeof s_cq_debug, "MATCH: %.54s", m->text);
+        pending_reply = *m;
+        reply_pending = true;
+        /* Cancel even an already-transmitting CQ. After the worker has
+         * fully muted CLK0 and released the relay, cq_tick() will arm
+         * the directed QSO reply. qso_auto_tick() can then use this same
+         * TX slot if less than one second has elapsed. */
+        si5351_tone_test_stop();
+
+    }
+    if (reply_pending) {
+        /* Never queue another CQ after seeing a directed reply. */
+        if (si5351_tone_test_running() || si5351_relay_is_tx()) {
+            /* Stop also covers the already queued next CQ. The Si5351 worker
+             * clears its running state after honoring the stop request. */
+            si5351_tone_test_stop();
+            snprintf(s_auto_status, sizeof s_auto_status, "CQ REPLY FOUND - CANCEL CQ TX");
+            return true;
+        }
+        const ft8_msg_t *m = &pending_reply;
+        char call[sizeof s_qso_call];
+        if (!qso_extract_call(m->text, call, sizeof call)) {
+            reply_pending = false;
+            return true;
+        }
+        char to[20] = "", from[20] = "", extra[20] = "";
+        (void)sscanf(m->text, "%19s %19s %19s", to, from, extra);
+        reply_pending = false;
+        /* The first qualifying decoded reply wins; later stations are ignored
+         * until this QSO is finished or manually stopped. */
+        s_cq_active = false;
+        s_qso_own_cq = true; /* Our CQ was answered: TX stays at 1500 Hz. */
+        snprintf(s_cq_debug, sizeof s_cq_debug, "QSO START: %.50s", m->text);
+        /* CQ MATCH must initialize the selected FT8 message as well.
+         * qso_sync_tx_frequency() requires its seq and audio frequency. */
+        s_qso_selected = *m;
+        snprintf(s_qso_call, sizeof s_qso_call, "%s", call);
+        s_qso_has_selected = true;
+        s_qso_wait_cq = false;
+        s_qso_history_n = 0;
+        s_qso_history_last_seq = m->seq;
+        s_qso_tx_pending = false;
+        s_qso_tx_seen = false;
+        s_qso_tx_step = -1;
+        qso_history_add(m->text, false, m->snr);
+        s_qso_step = qso_is_report(extra) ? 2 : 1;
+        /* A reply containing a report requires an R-report; a grid requires a report. */
+        s_qso_error = false;
+        s_auto = true;
+        s_auto_enabled = true;
+        s_auto_done = false;
+        s_auto_logged = false;
+        s_auto_final_queued = false;
+        s_auto_final_started = false;
+        s_auto_attempts = 0;
+        s_auto_tx_parity = s_cq_tx_parity;
+        /* CQ reply decoded at the RX/TX boundary: permit first REPORT
+         * in the current TX slot within the Si5351 safe late window. */
+        s_auto_fast_first = true;
+        s_auto_last_queued_slot = -1;
+        s_auto_last_seq = m->seq;
+        s_qso_rst_sent[0] = 0;
+        s_qso_rst_rcvd[0] = 0;
+        if (qso_is_report(extra))
+            snprintf(s_qso_rst_rcvd, sizeof s_qso_rst_rcvd, "%.7s", extra[0] == 'R' ? extra + 1 : extra);
+        s_qso_start_utc = 0;
+        ft8_set_qso_focus(s_qso_call, (int)m->freq);
+        qso_prepare();
+        snprintf(s_auto_status, sizeof s_auto_status,
+                 "CQ ANSWER %.15s - AUTO REPORT NEXT", s_qso_call);
+        return true;
+    }
+    if (si5351_tone_test_running()) return changed;
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    if (tv.tv_sec < 1760000000LL) {
+        snprintf(s_auto_status, sizeof s_auto_status, "CQ WAIT - UTC NOT VALID");
+        return false;
+    }
+    int64_t slot = (int64_t)tv.tv_sec / 15;
+    int sec = (int)(tv.tv_sec % 15);
+    if (((slot + 1) & 1LL) != s_cq_tx_parity) return changed;
+    if (sec < 13 || (sec == 13 && tv.tv_usec < 650000)) return changed;
+    if (sec >= 14 && tv.tv_usec >= 700000) return changed;
+    int64_t tx_slot = slot + 1;
+    if (s_cq_last_queued_slot == tx_slot) return changed;
+    /* 1500 Hz audio tone; keep the receiver dial frequency unchanged. */
+    uint64_t base = ((uint64_t)s_center + (uint64_t)s_cq_tx_audio_hz) * 100ULL;
+    esp_err_t err = si5351_ft8_set_base_cHz(base);
+    if (err == ESP_OK) err = si5351_ft8_set_message("CQ", station_call(), station_grid());
+    if (err == ESP_OK) err = si5351_tone_test_start_parity(s_cq_tx_parity);
+    if (err != ESP_OK) {
+        s_cq_active = false;
+        s_qso_error = true;
+        snprintf(s_auto_status, sizeof s_auto_status, "CQ TX ERROR: %s", esp_err_to_name(err));
+        return true;
+    }
+    s_cq_last_queued_slot = tx_slot;
+    s_qso_tx_step = -1;
+    snprintf(s_qso_tx_message, sizeof s_qso_tx_message, "CQ %s %s", station_call(), station_grid());
+    s_qso_tx_pending = true;
+    s_qso_tx_seen = false;
+    snprintf(s_auto_status, sizeof s_auto_status, "CQ TX QUEUED - %lu HZ EVEN", (unsigned long)s_cq_tx_audio_hz);
     return true;
 }
 
@@ -1227,14 +1494,27 @@ static void qso_draw(void)
     text(508, 9, 1, COL_LINE, mon_label);
     rect(530, 5, 98, 30, COL_BTN);
     text(553, 13, 2, COL_TEXT, "LOG");
+    /* CQ TX audio offset, directly below LOG. +/- adjust by 50 Hz. */
+    char cq_tx_label[24];
+    snprintf(cq_tx_label, sizeof cq_tx_label, "TX %lu Hz", (unsigned long)s_cq_tx_audio_hz);
+    rect(530, 39, 98, 15, COL_PANEL);
+    text(535, 43, 1, COL_LINE, cq_tx_label);
+    rect(530, 57, 46, 23, COL_BTN);
+    rect(582, 57, 46, 23, COL_BTN);
+    text(548, 63, 1, COL_TEXT, "-");
+    text(600, 63, 1, COL_TEXT, "+");
     char b[120];
     snprintf(b, sizeof b, "%s  SNR:%+d  RX:%dHz  %s",
-             s_qso_call, (int)s_qso_selected.snr, (int)s_qso_selected.freq,
-             s_auto ? "AUTO" : "MANUAL");
+             s_qso_has_selected ? s_qso_call : station_call(),
+             s_qso_has_selected ? (int)s_qso_selected.snr : 0,
+             s_qso_has_selected ? (int)s_qso_selected.freq : (int)s_cq_tx_audio_hz,
+             s_cq_active ? "CQ CALLING" : (s_auto ? "AUTO" : "MONITOR"));
     text(12, 37, 1, COL_LINE, b);
-    snprintf(b, sizeof b, "NEXT: %s", s_qso_preview);
+    char cq_preview[48];
+    snprintf(cq_preview, sizeof cq_preview, "CQ %s %s", station_call(), station_grid());
+    snprintf(b, sizeof b, "NEXT: %s", s_cq_active || !s_qso_has_selected ? cq_preview : s_qso_preview);
     text(12, 56, 2, COL_ACCENT, b);
-    text(12, 83, 1, COL_TEXT, "QSO HISTORY (RX GREEN / TX YELLOW):");
+    text(12, 83, 1, COL_TEXT, s_cq_active ? s_cq_debug : "QSO HISTORY (RX GREEN / TX YELLOW):");
     rect(10, 98, 620, 111, RGB565(17,25,43));
     int first = s_qso_history_n > 7 ? s_qso_history_n - 7 : 0;
     for (int i = first; i < s_qso_history_n; ++i) {
@@ -1267,15 +1547,47 @@ static void qso_draw(void)
              (unsigned long long)(si5351_ft8_get_base_cHz()/100ULL),
              si5351_tone_test_running() ? "TX QUEUED/ACTIVE" : "READY");
     text(183, 275, 1, COL_LINE, b);
-    rect(12, 299, 190, 51, COL_BTN);
-    text(61, 317, 2, COL_TEXT, "SEND");
-    rect(225, 299, 190, 51, COL_BTN);
-    text(269, 317, 2, COL_TEXT, "STOP");
-    rect(434, 299, 190, 51, COL_BTN);
-    text(485, 317, 2, COL_TEXT, "BACK");
+    rect(480, 256, 148, 27, s_auto_cq ? COL_ACCENT : COL_BTN);
+    text(490, 265, 1, s_auto_cq ? COL_BG : COL_TEXT,
+         s_auto_cq ? "AUTO QSO CQ: ON" : "AUTO QSO CQ: OFF");
+    rect(12, 299, 142, 51, COL_BTN);
+    text(49, 317, 2, COL_TEXT, "SEND");
+    rect(168, 299, 142, 51, COL_BTN);
+    text(205, 317, 2, COL_TEXT, "STOP");
+    rect(324, 299, 142, 51, s_cq_active ? COL_ACCENT : COL_BTN_HI);
+    text(374, 317, 2, s_cq_active ? COL_BG : COL_TEXT, "CQ");
+    rect(480, 299, 148, 51, COL_BTN);
+    text(518, 317, 2, COL_TEXT, "BACK");
 }
 static bool qso_touch(int x, int y)
 {
+    if (x >= 530 && x < 628 && y >= 57 && y < 80) {
+        /* Do not change an active or queued transmission. */
+        if (si5351_tone_test_running() || si5351_relay_is_tx()) {
+            snprintf(s_auto_status, sizeof s_auto_status, "WAIT UNTIL TX FINISHES TO CHANGE CQ FREQ");
+            return true;
+        }
+        uint32_t next = s_cq_tx_audio_hz;
+        if (x < 576) {
+            if (next >= CQ_TX_AUDIO_MIN + CQ_TX_AUDIO_STEP) next -= CQ_TX_AUDIO_STEP;
+        } else if (x >= 582) {
+            if (next <= CQ_TX_AUDIO_MAX - CQ_TX_AUDIO_STEP) next += CQ_TX_AUDIO_STEP;
+        }
+        if (next != s_cq_tx_audio_hz) {
+            s_cq_tx_audio_hz = next;
+            cq_tx_audio_save();
+            /* When idle, update the displayed RF TX base for our own CQ. */
+            if (!s_qso_has_selected || s_qso_own_cq) {
+                esp_err_t err = si5351_ft8_set_base_cHz(
+                    ((uint64_t)s_center + s_cq_tx_audio_hz) * 100ULL);
+                if (err == ESP_OK)
+                    s_qso_rf_base_chz = ((uint64_t)s_center + s_cq_tx_audio_hz) * 100ULL;
+            }
+            snprintf(s_auto_status, sizeof s_auto_status, "CQ TX AUDIO: %lu HZ (SAVED)",
+                     (unsigned long)s_cq_tx_audio_hz);
+        }
+        return true;
+    }
     if (y >= 10 && y < 35 && x >= TX_MON_X - 6 && x <= TX_MON_X + TX_MON_W + 6) {
         s_tx_mon_drag = true;
         (void)tx_mon_volume_touch(x);
@@ -1286,7 +1598,7 @@ static bool qso_touch(int x, int y)
         s_ft8_log_confirm = false; s_ft8_log_notice[0] = 0;
         ft8_log_refresh(); s_menu = 13; return true;
     }
-    if (y >= 218 && y < 248 && x >= 12 && x < 637 && !s_auto) {
+    if (y >= 218 && y < 248 && x >= 12 && x < 637 && !s_auto && !s_cq_active && s_qso_has_selected) {
         int idx = (x - 12) / 125;
         if (idx >= 0 && idx < 5 && (x - 12) % 125 < 117 &&
             !si5351_tone_test_running()) {
@@ -1296,13 +1608,23 @@ static bool qso_touch(int x, int y)
         }
         return true;
     }
-    if (y >= 256 && y < 283 && x >= 12 && x < 172) {
+    if (y >= 256 && y < 283 && x >= 480 && x < 628) {
+        s_auto_cq = !s_auto_cq;
+        snprintf(s_auto_status, sizeof s_auto_status, "%s",
+                 s_auto_cq ? "AUTO CQ ENABLED" : "AUTO CQ DISABLED");
+        return true;
+    }
+    if (y >= 256 && y < 283 && x >= 12 && x < 172 && s_qso_has_selected && !s_cq_active) {
         /* AUTO SEQ is an ARM button, not a toggle: pressing it when
          * already ON must never cancel the first CQ response.
          * Use STOP to disable AUTO explicitly. */
         if (s_auto && s_auto_enabled) {
             snprintf(s_auto_status, sizeof s_auto_status,
                      "AUTO ALREADY ON - WAIT TX SLOT");
+        }
+        else if (s_qso_wait_cq) {
+            snprintf(s_auto_status, sizeof s_auto_status,
+                     "MONITOR - WAIT FOR FRESH CQ BEFORE ARM");
         }
         else if (!si5351_tone_test_running()) {
             s_auto_enabled = true;
@@ -1319,7 +1641,17 @@ static bool qso_touch(int x, int y)
         return true;
     }
     if (y >= 299 && y < 350) {
-        if (x >= 12 && x < 202 && !s_auto && !si5351_tone_test_running()) {
+        if (x >= 12 && x < 154 && s_qso_has_selected && !s_cq_active) {
+            /* Manual SEND joins the current FT8 slot, skipping elapsed symbols. */
+            if (si5351_tone_test_running() || si5351_relay_is_tx()) {
+                snprintf(s_auto_status, sizeof s_auto_status, "SEND: TX ALREADY QUEUED/ACTIVE");
+                return true;
+            }
+            if (s_qso_wait_cq) {
+                snprintf(s_auto_status, sizeof s_auto_status,
+                         "MONITOR - WAIT FOR CQ BEFORE TX");
+                return true;
+            }
             if (s_auto_tx_parity < 0) {
                 s_qso_error = true;
                 snprintf(s_auto_status, sizeof s_auto_status, "TX SLOT UNKNOWN - SELECT FRESH CQ");
@@ -1329,15 +1661,75 @@ static bool qso_touch(int x, int y)
             if (sscanf(s_qso_preview, "%15s %15s %15s", to, from, extra) == 3) {
                 esp_err_t err = qso_sync_tx_frequency();
                 if (err == ESP_OK) err = si5351_ft8_set_message(to, from, extra);
-                if (err == ESP_OK) err = si5351_tone_test_start_parity(s_auto_tx_parity);
-                if (err == ESP_OK) qso_history_queue_tx();
+                if (err == ESP_OK) err = si5351_tone_test_start_immediate();
+                if (err == ESP_OK) {
+                    qso_history_queue_tx();
+                    /* A manual late SEND occupies the CURRENT UTC TX slot,
+                     * not the next matching slot. Marking a future slot here
+                     * would prevent AUTO SEQ from resuming after this frame. */
+                    struct timeval send_tv;
+                    gettimeofday(&send_tv, NULL);
+                    int64_t send_slot = (int64_t)send_tv.tv_sec / 15;
+                    s_auto_last_queued_slot = send_slot;
+                    /* Manual SEND is a one-frame override, not AUTO OFF.
+                     * After the TX worker finishes, qso_auto_tick() resumes
+                     * monitoring replies and scheduling the next QSO step. */
+                    s_auto_enabled = true;
+                    s_auto = true;
+                    s_auto_done = false;
+                    if (!s_qso_start_utc) s_qso_start_utc = (time_t)(send_slot * 15);
+                    if (s_qso_step == 4 && s_auto) {
+                        s_auto_final_queued = true;
+                        s_auto_final_started = false;
+                    }
+                    ++s_auto_attempts;
+                    snprintf(s_auto_status, sizeof s_auto_status,
+                             "SEND TX - AUTO SEQ CONTINUES");
+                } else {
+                    snprintf(s_auto_status, sizeof s_auto_status,
+                             "SEND ERROR: %s", esp_err_to_name(err));
+                }
                 s_qso_error = (err != ESP_OK);
-            } else s_qso_error = true;
-        } else if (x >= 225 && x < 415) {
-            s_auto_enabled = false; /* STOP is an explicit manual disable. */
+            } else {
+                s_qso_error = true;
+                snprintf(s_auto_status, sizeof s_auto_status, "SEND ERROR: INVALID MESSAGE");
+            }
+        } else if (x >= 168 && x < 310) {
+            s_cq_active = false;
+            s_qso_own_cq = false;
+            s_auto_cq = false;
+            /* STOP cancels the current QSO only. Keep AUTO SEQ armed for the next CQ selection. */
+            s_auto_enabled = true;
             qso_auto_off("STOPPED - AUTO OFF");
             si5351_tone_test_stop();
-        } else if (x >= 434 && x < 624) {
+        } else if (x >= 324 && x < 466) {
+            if (s_cq_active) {
+                s_cq_active = false;
+                si5351_tone_test_stop();
+                snprintf(s_auto_status, sizeof s_auto_status, "CQ STOPPED");
+            } else if (!s_auto && !si5351_tone_test_running()) {
+                s_cq_active = true;
+                s_qso_own_cq = false;
+                /* CQ initiator: first reply is REPORT, never CALL. */
+                s_qso_step = 1;
+                s_cq_seen_count = 0;
+                snprintf(s_cq_debug, sizeof s_cq_debug, "CQ ARMED - WAIT RX");
+                s_qso_has_selected = false;
+                s_qso_call[0] = 0;
+                s_qso_history_n = 0;
+                s_qso_history_last_seq = 0;
+                s_qso_tx_pending = false;
+                s_qso_tx_step = -1;
+                s_cq_last_queued_slot = -1;
+                ft8_msg_t cq_msgs[24];
+                ft8_status_t cq_st;
+                int cq_n = ft8_get_messages(cq_msgs, 24, &cq_st);
+                s_cq_last_rx_seq = cq_n ? cq_msgs[cq_n - 1].seq : 0;
+                ft8_set_qso_focus(NULL, 0);
+                s_qso_error = false;
+                snprintf(s_auto_status, sizeof s_auto_status, "CQ ARMED - %lu HZ EVEN", (unsigned long)s_cq_tx_audio_hz);
+            }
+        } else if (x >= 480 && x < 628) {
             /* BACK only closes the QSO screen; AUTO continues in background. */
             s_menu = 0;
             s_panel_mode = -1;
@@ -1346,11 +1738,37 @@ static bool qso_touch(int x, int y)
     return true;
 }
 
+/* Large FT8 return button: same 46x44 touch size as VOL +. */
+#define FT8_BACK_X 590
+#define FT8_BACK_Y 112
+#define FT8_BACK_W 46
+#define FT8_BACK_H 44
+
+#define FT8_FILTER_X FT8_BACK_X
+#define FT8_FILTER_Y (FT8_BACK_Y + FT8_BACK_H + 4)
+#define FT8_FILTER_W FT8_BACK_W
+#define FT8_FILTER_H 44
+
+static void ft8_draw_filter_button(void)
+{
+    rect(FT8_FILTER_X, FT8_FILTER_Y, FT8_FILTER_W, FT8_FILTER_H, COL_BTN_HI);
+    text(FT8_FILTER_X + (s_ft8_cq_only ? 11 : 5), FT8_FILTER_Y + 15, 2,
+         COL_TEXT, s_ft8_cq_only ? "CQ" : "ALL");
+}
+
+static void ft8_draw_back_button(void)
+{
+    rect(FT8_BACK_X, FT8_BACK_Y, FT8_BACK_W, FT8_BACK_H,
+         s_auto ? COL_ACCENT : COL_BTN_HI);
+    text(FT8_BACK_X + 5, FT8_BACK_Y + 15, 2,
+         s_auto ? COL_BG : COL_TEXT, "QSO");
+}
+
 static void draw_ft8_panel(void)
 {
     ft8_msg_t msgs[PANEL_COLS * PANEL_ROWS];
     ft8_status_t st;
-    int n = ft8_get_messages(msgs, PANEL_COLS * PANEL_ROWS, &st); /* oldest first */
+    int n = ft8_visible_messages(msgs, PANEL_COLS * PANEL_ROWS, &st); /* oldest first */
     bool body = panel_begin(DSP_MODE_FT8, st.total);
 
     char b[100];
@@ -1360,16 +1778,12 @@ static void draw_ft8_panel(void)
     else
         snprintf(b, sizeof b, "FT8  SCANNING FOR THE SLOT TIMING   MSGS %u", (unsigned)st.total);
     text(6, WF_Y0 + 3, 1, st.locked ? RGB565(60, 220, 140) : RGB565(255, 190, 60), b);
-    /* Persistent shortcut: return to the QSO without selecting a decoded row. */
-    if (s_qso_has_selected) {
-        rect(553, WF_Y0 + 1, 80, 12, s_auto ? COL_ACCENT : COL_BTN);
-        text(572, WF_Y0 + 3, 1, s_auto ? COL_BG : COL_TEXT, "QSO");
-    }
-    if (!body) return;
+    if (!body) { ft8_draw_back_button(); ft8_draw_filter_button(); return; }
 
     if (n == 0) {
-        text(6, WF_Y0 + 3 + PANEL_HDR_H, 1, RGB565(170, 170, 170), "NO MESSAGES YET. TUNE TO AN FT8 FREQUENCY IN USB,");
-        text(6, WF_Y0 + 3 + PANEL_HDR_H + 10, 1, RGB565(170, 170, 170), "E.G. 14.074 MHZ (20 M). THE FIRST DECODE SETS THE SLOT TIMING.");
+        text(6, WF_Y0 + 3 + PANEL_HDR_H, 1, RGB565(170, 170, 170), s_ft8_cq_only ? "NO CQ CALLS IN RECENT DECODED MESSAGES" : "NO MESSAGES YET. TUNE TO AN FT8 FREQUENCY IN USB,");
+        text(6, WF_Y0 + 3 + PANEL_HDR_H + 10, 1, RGB565(170, 170, 170), s_ft8_cq_only ? "PRESS CQ TO RETURN TO ALL MESSAGES" : "E.G. 14.074 MHZ (20 M). THE FIRST DECODE SETS THE SLOT TIMING.");
+        ft8_draw_back_button(); ft8_draw_filter_button();
         return;
     }
     panel_separators();
@@ -1381,6 +1795,7 @@ static void draw_ft8_panel(void)
         if (m->slot == newest_slot && m->text[0] == 'C' && m->text[1] == 'Q') color = RGB565(255, 220, 0); /* CQ calls */
         panel_line(k, n, color, b);
     }
+    ft8_draw_back_button(); ft8_draw_filter_button();
 }
 
 static void draw_wspr_panel(void)
@@ -2293,14 +2708,16 @@ static int s_ft8_tx_band = 8; /* original 10 MHz test */
 static uint64_t ft8_tx_base_for_band(int i)
 {
     return s_ft8_tx_bands[i].dial_hz ?
-        ((uint64_t)s_ft8_tx_bands[i].dial_hz + 1500ULL) * 100ULL : 1000000000ULL;
+        ((uint64_t)s_ft8_tx_bands[i].dial_hz + (uint64_t)s_cq_tx_audio_hz) * 100ULL : 1000000000ULL;
 }
 
 static void tone_draw(void)
 {
     rect(0, 0, LW, LH, RGB565(10,14,30));
     text(16, 8, 2, COL_ACCENT, "FT8 TX BAND");
-    text(16, 31, 1, COL_TEXT, "CQ 9A3ZI JN86  -  79 SYMBOLS / UTC 15S");
+    char cq_heading[96];
+    snprintf(cq_heading, sizeof cq_heading, "CQ %s %s  -  79 SYMBOLS / UTC 15S", station_call(), station_grid());
+    text(16, 31, 1, COL_TEXT, cq_heading);
     bool running = si5351_tone_test_running();
     for (int i = 0; i < FT8_TX_BAND_COUNT; ++i) {
         box_t r = {16 + (i % 3) * 208, 55 + (i / 3) * 48, 192, 42};
@@ -2310,7 +2727,7 @@ static void tone_draw(void)
     char b[96];
     uint64_t chz = ft8_tx_base_for_band(s_ft8_tx_band);
     snprintf(b, sizeof b, "RF %.6f MHz  (%s)", (double)chz / 100000000.0,
-             s_ft8_tx_band == 8 ? "10 MHZ TEST" : "USB DIAL + 1500 HZ");
+             s_ft8_tx_band == 8 ? "10 MHZ TEST" : "USB DIAL + CQ TX AUDIO");
     text(16, 202, 1, COL_LINE, b);
     box_t start = {16, 226, 190, 55};
     box_t stop = {225, 226, 190, 55};
@@ -2515,7 +2932,7 @@ static bool settings_touch(int x,int y)
         if(y>=220 && y<262) {
             if(x<318) {
                 s_st_saved=station_settings_save(&s_st_edit);
-                if(s_st_saved)wifi_net_apply_settings();
+                if(s_st_saved){ station_identity_reload(); wifi_net_apply_settings(); }
             } else {s_menu=1;}
             return true;
         }
@@ -2919,7 +3336,22 @@ static bool handle_touch(void)
         int ty = p[0].x / SCALE;
         quick_qso_touch = tx >= 0 && tx < LW && ty >= SPEC_Y0 && ty < CTRL_Y0;
     }
-    bool pressed = (run >= 2) || (run == 1 && (quick_mode_touch || quick_qso_touch));
+    /* FT8 decoded rows must respond to short taps as reliably as mode keys.
+     * A touch in the list is never interpreted as a frequency gesture. */
+    bool quick_ft8_row_touch = false;
+    if (n == 1 && s_menu == 0 && !s_scr_off &&
+        s_mode == DSP_MODE_FT8 && !lora_aprs_enabled()) {
+        int ty = p[0].x / SCALE;
+        int tx = (PANEL_H - p[0].y) / SCALE;
+        quick_ft8_row_touch = (ty >= WF_Y0 + 3 + PANEL_HDR_H &&
+                              ty < WF_Y0 + 3 + PANEL_HDR_H + PANEL_ROWS * 10) ||
+                             (tx >= FT8_BACK_X && tx < FT8_BACK_X + FT8_BACK_W &&
+                              ty >= FT8_BACK_Y && ty < FT8_BACK_Y + FT8_BACK_H) ||
+                             (tx >= FT8_FILTER_X && tx < FT8_FILTER_X + FT8_FILTER_W &&
+                              ty >= FT8_FILTER_Y && ty < FT8_FILTER_Y + FT8_FILTER_H);
+    }
+    bool pressed = (run >= 2) || (run == 1 &&
+                    (quick_mode_touch || quick_qso_touch || quick_ft8_row_touch));
     bool two = pressed && n >= 2;
 
     if (s_scr_off) { /* screensaver: the touch only wakes the display */
@@ -2942,7 +3374,12 @@ static bool handle_touch(void)
     /* One confirmation per debounced press, not per frame or drag step. */
     if (edge && s_touch_beep && (s_menu || ly >= CTRL_Y0 ||
         (ly < SPEC_Y0 && lx >= 180 && lx < 470) ||
-        (s_mode == DSP_MODE_RS41 && lx >= 540 && ly >= WF_Y0 + 3 && ly < WF_Y0 + 29))) {
+        (s_mode == DSP_MODE_RS41 && lx >= 540 && ly >= WF_Y0 + 3 && ly < WF_Y0 + 29) ||
+        (s_mode == DSP_MODE_FT8 && !lora_aprs_enabled() &&
+         ((lx >= FT8_BACK_X && lx < FT8_BACK_X + FT8_BACK_W &&
+           ly >= FT8_BACK_Y && ly < FT8_BACK_Y + FT8_BACK_H) ||
+          (lx >= FT8_FILTER_X && lx < FT8_FILTER_X + FT8_FILTER_W &&
+           ly >= FT8_FILTER_Y && ly < FT8_FILTER_Y + FT8_FILTER_H))))) {
         audio_touch_beep();
     }
 
@@ -3054,17 +3491,27 @@ static bool handle_touch(void)
         return true;
     }
 
+    /* FT8 ALL/CQ display filter. Does not affect decoder or AUTO SEQ. */
+    if (edge && s_mode == DSP_MODE_FT8 && !lora_aprs_enabled() &&
+        lx >= FT8_FILTER_X && lx < FT8_FILTER_X + FT8_FILTER_W &&
+        ly >= FT8_FILTER_Y && ly < FT8_FILTER_Y + FT8_FILTER_H) {
+        s_ft8_cq_only = !s_ft8_cq_only;
+        dragging = false;
+        prev = pressed;
+        return true;
+    }
+
     /* Reopen the active QSO without resetting its state or TX parity. */
-    if (edge && s_mode == DSP_MODE_FT8 && s_qso_has_selected &&
-        !lora_aprs_enabled() && lx >= 553 && lx < 633 &&
-        ly >= WF_Y0 + 1 && ly < WF_Y0 + 14) {
+    if (edge && s_mode == DSP_MODE_FT8 &&
+        !lora_aprs_enabled() && lx >= FT8_BACK_X && lx < FT8_BACK_X + FT8_BACK_W &&
+        ly >= FT8_BACK_Y && ly < FT8_BACK_Y + FT8_BACK_H) {
         s_menu = 12;
         dragging = false;
         prev = pressed;
         return true;
     }
 
-    /* FT8 decoded text: tap a CQ or a message addressed to 9A3ZI. */
+    /* FT8 decoded text: select any station, including an ongoing QSO. */
     if (edge && s_mode == DSP_MODE_FT8 && !lora_aprs_enabled() &&
         ly >= WF_Y0 + 3 + PANEL_HDR_H && ly < WF_Y0 + 3 + PANEL_HDR_H + PANEL_ROWS * 10) {
         if (qso_select_panel_row(lx, ly)) {
@@ -3087,7 +3534,17 @@ static bool handle_touch(void)
         return true;
     }
 
-    if (pressed && ly < CTRL_Y0 && !lora_aprs_enabled()) {
+    /* In FT8, decoded-message rows are never a tuning gesture. Allow
+     * drag/tap tuning only in the upper spectrum area (above WF_Y0).
+     * This also prevents an imprecise touch from retuning the receiver. */
+    if (s_mode == DSP_MODE_FT8 && pressed && ly >= WF_Y0 && ly < CTRL_Y0) {
+        dragging = false;
+        tap_moved = true;
+        prev = pressed;
+        return changed;
+    }
+    if (pressed && ly < CTRL_Y0 && !lora_aprs_enabled() &&
+        (s_mode != DSP_MODE_FT8 || ly < WF_Y0)) {
         /* drag the spectrum/waterfall to scan */
         if (edge) { dragging = true; drag_x0 = lx; drag_f0 = s_center; tap_moved = false; tap_y = ly; }
         else if (dragging) {
@@ -3259,7 +3716,7 @@ static void ui_task(void *arg)
     /* welcome splash: title + callsign centred on the whole display */
     rect(0, 0, LW, LH, COL_PANEL);
     text((LW - text_w(SPLASH_TITLE, 6)) / 2, 126, 6, COL_ACCENT, SPLASH_TITLE);
-    text((LW - text_w(SPLASH_CALL, 4)) / 2, 180, 4, COL_LINE, SPLASH_CALL);
+    text((LW - text_w(station_call(), 4)) / 2, 180, 4, COL_LINE, station_call());
     present();
     vTaskDelay(pdMS_TO_TICKS(SPLASH_MS));
 
@@ -3293,6 +3750,8 @@ static void ui_task(void *arg)
             dirty = true;
         }
         previous_menu = s_menu;
+        /* Process directed CQ replies before scheduling AUTO TX. */
+        if (cq_tick()) dirty = true;
         if (qso_auto_tick()) dirty = true;
         if (qso_history_rx_tick()) dirty = true;
         if (rs_scan_tick()) dirty = true;
@@ -3407,6 +3866,7 @@ void ui_start(void)
     scr_off_load();
     touch_beep_load();
     tx_mon_volume_load();
+    cq_tx_audio_load();
     bandplan_init();
     bandplan_set_apply_cb(plan_apply);
 

@@ -145,9 +145,12 @@ static char s_tx_from[16] = "9A3ZI";
 static char s_tx_extra[16] = "JN86";
 static char s_tx_label[64] = "CQ 9A3ZI JN86";
 static volatile bool s_tone_running;
+static bool s_force_immediate_tx = false;
 static int s_requested_tx_parity = -1; /* -1 = manual next slot */
-#define FT8_FAST_LATE_MAX_US 1000000LL
+#define FT8_FAST_LATE_MAX_US 1000000LL /* maximum allowed start delay */
 #define FT8_FAST_PREP_US 80000LL
+/* TX timing relative to the UTC 15-second boundary. Tune in 100 ms steps. */
+#define FT8_TX_TIME_OFFSET_US 500000LL
 static volatile bool s_tone_stop;
 static volatile int s_tone_index = -1;
 static bool s_output_configured;
@@ -352,14 +355,20 @@ static bool wait_for_ft8_slot(int64_t *start_us)
             if (s_requested_tx_parity >= 0 &&
                 ((next_slot / 15000000LL) & 1LL) != s_requested_tx_parity)
                 next_slot += 15000000LL;
-            *start_us = (fast ? utc_us + FT8_FAST_PREP_US : next_slot) -
-                        s_utc_minus_mono_us;
-            if (fast)
-                ESP_LOGI(TAG, "FAST QSO TX: current slot, late %lld ms",
-                         (long long)((elapsed + FT8_FAST_PREP_US) / 1000LL));
-            ESP_LOGI(TAG, "WAIT: UTC slot %lld (clock=%s)",
+            /* Use the SAME UTC reference for regular and fast QSO TX.
+             * Fast TX still uses the current parity-matched slot. If queued
+             * after the calibrated boundary, start as soon as preparation
+             * allows; we cannot move a past boundary backwards in time. */
+            int64_t target_utc_us = next_slot + FT8_TX_TIME_OFFSET_US;
+            if (fast && target_utc_us < utc_us + FT8_FAST_PREP_US)
+                target_utc_us = utc_us + FT8_FAST_PREP_US;
+            ESP_LOGI(TAG, "WAIT: %s UTC slot %lld, offset %lld ms, scheduled +%lld ms (clock=%s)",
+                     fast ? "FAST" : "NORMAL",
                      (long long)(next_slot / 1000000LL),
+                     (long long)(FT8_TX_TIME_OFFSET_US / 1000LL),
+                     (long long)((target_utc_us - next_slot) / 1000LL),
                      clock_valid ? "system" : "cached");
+            *start_us = target_utc_us - s_utc_minus_mono_us;
             return true;
         }
         if (mono >= deadline) {
@@ -391,14 +400,42 @@ static void tone_task(void *arg)
 
     if (si5351_clk0_enable(false) != ESP_OK) goto finish;
     int64_t start_us = 0;
-    if (!wait_for_ft8_slot(&start_us)) goto finish;
+    int first_symbol = 0;
+    if (s_force_immediate_tx) {
+        /* WSJT-X-like late SEND: retain the original UTC symbol timeline.
+         * Skip symbols already elapsed instead of extending the frame. */
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        if ((int64_t)tv.tv_sec < 1760000000LL) {
+            ESP_LOGE(TAG, "LATE SEND: valid UTC time required");
+            goto finish;
+        }
+        int64_t mono = esp_timer_get_time();
+        int64_t wall_us = (int64_t)tv.tv_sec * 1000000LL + tv.tv_usec;
+        int64_t slot_us = (wall_us / 15000000LL) * 15000000LL;
+        if (s_requested_tx_parity >= 0 &&
+            ((slot_us / 15000000LL) & 1LL) != s_requested_tx_parity) {
+            ESP_LOGW(TAG, "LATE SEND: not our TX parity slot");
+            goto finish;
+        }
+        start_us = mono + slot_us + FT8_TX_TIME_OFFSET_US - wall_us;
+        /* Allow I2C setup and antenna relay settling before the first symbol. */
+        int64_t ready_us = mono + 100000LL;
+        if (ready_us > start_us) {
+            first_symbol = (int)((ready_us - start_us + 159999LL) / 160000LL);
+        }
+        if (first_symbol >= FT8_NN) {
+            ESP_LOGW(TAG, "LATE SEND: FT8 frame already finished");
+            goto finish;
+        }
+        ESP_LOGW(TAG, "LATE SEND: skip %d symbols, finish at original UTC frame end", first_symbol);
+    } else if (!wait_for_ft8_slot(&start_us)) goto finish;
     ESP_LOGI(TAG, "WAIT: prepared FT8 frame %s", s_tx_label);
 
     const uint64_t tx_base_chz = s_ft8_base_chz;
     ESP_LOGI(TAG, "FT8 RF base: %llu cHz", (unsigned long long)tx_base_chz);
     /* Preload the first symbol while CLK0 is muted. */
-    if (si5351_set_frequency_cHz(tx_base_chz + (uint64_t)tones[0] * 625ULL) != ESP_OK)
-        goto finish;
+    if (si5351_set_frequency_cHz(tx_base_chz + (uint64_t)tones[first_symbol] * 625ULL) != ESP_OK) goto finish;
     /* Stay in RX throughout the waiting period; key only just before TX. */
     wait_until_us(start_us - (int64_t)FT8_RELAY_SETTLE_MS * 1000LL);
     if (s_tone_stop) goto finish;
@@ -406,18 +443,20 @@ static void tone_task(void *arg)
     /* Mute SDR as soon as the antenna is switched to TX. */
     audio_ft8_tx_monitor_start();
     vTaskDelay(pdMS_TO_TICKS(FT8_RELAY_SETTLE_MS));
-    if (esp_timer_get_time() >= start_us + 100000LL) {
-        ESP_LOGE(TAG, "TX relay missed slot boundary; aborting frame");
+    /* Allow limited scheduler/relay latency, but never transmit a badly late frame. */
+    const int64_t relay_lateness_us = esp_timer_get_time() - start_us;
+    if (!s_force_immediate_tx && relay_lateness_us >= 100000LL) {
+        ESP_LOGE(TAG, "TX relay missed slot boundary by %lld ms; aborting frame",
+                 (long long)(relay_lateness_us / 1000LL));
         goto finish;
     }
-    wait_until_us(start_us);
+    wait_until_us(start_us + (int64_t)first_symbol * 160000LL);
     if (s_tone_stop) goto finish;
-    s_tone_index = 0;
+    s_tone_index = first_symbol;
     if (si5351_clk0_enable(true) != ESP_OK) goto finish;
-    audio_ft8_tx_monitor_symbol(tones[0]);
-    ESP_LOGI(TAG, "TX: FT8 frame started");
+    audio_ft8_tx_monitor_symbol(tones[first_symbol]);
 
-    for (int n = 1; n < FT8_NN && !s_tone_stop; ++n) {
+    for (int n = first_symbol + 1; n < FT8_NN && !s_tone_stop; ++n) {
         wait_until_us(start_us + (int64_t)n * 160000LL);
         if (s_tone_stop) break;
         s_tone_index = n;
@@ -450,11 +489,30 @@ esp_err_t si5351_tone_test_start_parity(int parity)
     if (parity < -1 || parity > 1) return ESP_ERR_INVALID_ARG;
     if (s_tone_running || !s_dev) return ESP_ERR_INVALID_STATE;
     s_requested_tx_parity = parity;
+    s_force_immediate_tx = false;
     s_tone_stop = false;
     s_tone_index = -1;
     s_tone_running = true;
     if (xTaskCreate(tone_task, "si5351_tones", 4096, NULL, 4, NULL) != pdPASS) {
         s_tone_running = false;
+        s_tone_index = -1;
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+/* Manual SEND: join the current parity-matched FT8 frame, skipping elapsed symbols. */
+esp_err_t si5351_tone_test_start_immediate(void)
+{
+    if (s_tone_running || !s_dev) return ESP_ERR_INVALID_STATE;
+    /* Use the already selected CQ parity for the late current-slot send. */
+    s_force_immediate_tx = true;
+    s_tone_stop = false;
+    s_tone_index = -1;
+    s_tone_running = true;
+    if (xTaskCreate(tone_task, "si5351_tones", 4096, NULL, 4, NULL) != pdPASS) {
+        s_tone_running = false;
+        s_force_immediate_tx = false;
         s_tone_index = -1;
         return ESP_ERR_NO_MEM;
     }
@@ -468,6 +526,7 @@ esp_err_t si5351_tone_test_start(void)
 
 void si5351_tone_test_stop(void)
 {
+    ESP_LOGW(TAG, "CQ DIAG: stop requested running=%d relay=%d", (int)s_tone_running, (int)s_relay_tx);
     s_tone_stop = true;
     /* Also stop the continuous 10 MHz calibration carrier when idle. */
     if (!s_tone_running && s_dev) {

@@ -15,6 +15,7 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "nvs_flash.h"
 
 #include "bsp_tab5.h"
 #include "sdr.h"
@@ -106,6 +107,14 @@ esp_log_level_set("SI5351", ESP_LOG_INFO);
         .wifi.enable = false,
         .bluetooth.enable = false,
     }));
+    /* Si5351 calibration is stored in NVS. Initialise it before Si5351. */
+    esp_err_t nvs_err = nvs_flash_init();
+    if (nvs_err != ESP_OK) {
+        ESP_LOGE(TAG, "NVS initialization failed: %s", esp_err_to_name(nvs_err));
+        /* Do not erase NVS automatically: other saved settings may be present. */
+        return;
+    }
+
     // ===== Si5351 initialization =====
     ESP_ERROR_CHECK(si5351_init());
     /* Do not start the continuous 10 MHz calibration carrier at boot.

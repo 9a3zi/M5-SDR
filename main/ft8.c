@@ -53,7 +53,8 @@ static const char *TAG = "ft8";
 #define STRIDE      (TIME_OSR * FREQ_OSR * NUM_BINS)
 
 #define SLOT_SAMPLES (15 * SR)            /* 180000                               */
-#define EARLY_BLOCKS 84                   /* focused QSO pass ends ~13.14 s */
+#define EARLY_BLOCKS 84                   /* first focused QSO decode */
+#define FOCUS_RETRY_BLOCKS 88             /* retry weak QSO signal before full decode */
 #define WIN_BLOCKS   92                   /* 14.7 s: decode window length         */
 #define PRE_ROLL     3600                 /* locked window starts 0.3 s early     */
 #define W_CAP        200                  /* waterfall blocks kept                */
@@ -408,7 +409,7 @@ static int decode_window(int64_t ws, int nblk, int64_t boundary, uint16_t slot, 
         bool near = focus_hz && fabsf(candidate_hz - focus_hz) <= 120.0f;
         if (focus_only && !near) continue;
         if (!focus_only && (pass == 0 ? !near : near)) continue;
-        if ((i & 7) == 7) FT8_YIELD();
+        if ((i & (focus_only ? 31 : 7)) == (focus_only ? 31 : 7)) FT8_YIELD();
         ftx_message_t msg;
         ftx_decode_status_t st;
         if (!ftx_decode_candidate(&wf, c, LDPC_ITER, &msg, &st)) continue;
@@ -456,6 +457,8 @@ static int64_t s_next_B;     /* absolute sample index of the next slot boundary 
 static uint16_t s_slot_no;
 static int s_empty;
 static bool s_early_done;
+static bool s_focus_retry_done;
+static bool s_focus_found_early;
 static int64_t s_next_scan;  /* block index at which to try the next scan decode */
 
 /* ---- message list (UI) ------------------------------------------------------------- */
@@ -577,6 +580,8 @@ static void soft_reset(void)
     s_locked = false;
     s_empty = 0;
     s_early_done = false;
+    s_focus_retry_done = false;
+    s_focus_found_early = false;
     s_next_scan = 0;
     s_next_B = 0;
     s_slot_no = 0;
@@ -598,6 +603,8 @@ static void lock_to(int64_t boundary)
     s_locked = true;
     s_empty = 0;
     s_early_done = false;
+    s_focus_retry_done = false;
+    s_focus_found_early = false;
     s_stat.locked = true;
     ESP_LOGI(TAG, "slot phase locked");
 }
@@ -631,12 +638,25 @@ static void do_locked_decode(void)
     /* Try the active QSO before the entire 14.7 s waterfall is ready. */
     if (!s_early_done && s_total_blocks >= ws + EARLY_BLOCKS && ws >= W_base) {
         s_early_done = true;
+        uint32_t before = s_msg_total;
         (void)decode_window(ws, EARLY_BLOCKS, s_next_B, s_slot_no, true);
+        s_focus_found_early = (s_msg_total != before);
+    }
+    /* If the first short window missed a weak QSO signal, retry with more
+     * symbols before the full-band pass. Never repeat a successful decode. */
+    if (s_early_done && !s_focus_retry_done && !s_focus_found_early &&
+        s_total_blocks >= ws + FOCUS_RETRY_BLOCKS && ws >= W_base) {
+        s_focus_retry_done = true;
+        uint32_t before = s_msg_total;
+        (void)decode_window(ws, FOCUS_RETRY_BLOCKS, s_next_B, s_slot_no, true);
+        s_focus_found_early = (s_msg_total != before);
     }
     if (s_total_blocks < ws + WIN_BLOCKS) return; /* not enough audio yet */
     if (ws < W_base) { /* fell too far behind: skip this slot */
         s_next_B += SLOT_SAMPLES;
         s_early_done = false;
+    s_focus_retry_done = false;
+    s_focus_found_early = false;
         return;
     }
     int n = decode_window(ws, WIN_BLOCKS, s_next_B, s_slot_no, false);
@@ -654,6 +674,8 @@ static void do_locked_decode(void)
     s_stat.slots = s_slot_no;
     s_next_B += SLOT_SAMPLES;
     s_early_done = false;
+    s_focus_retry_done = false;
+    s_focus_found_early = false;
     s_empty = (n > 0) ? 0 : s_empty + 1;
     if (s_empty >= EMPTY_UNLOCK) { /* nothing for a while: the phase may be wrong → scan again */
         s_locked = false;
