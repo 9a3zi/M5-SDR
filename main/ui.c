@@ -796,6 +796,7 @@ static bool qso_is_report(const char *s)
     return s[1] >= '0' && s[1] <= '9' && s[2] >= '0' && s[2] <= '9' && !s[3];
 }
 
+static void ft8_b4_invalidate(void);
 static void qso_log_adif(void)
 {
     if (s_auto_logged || !s_qso_start_utc) return;
@@ -832,6 +833,7 @@ static void qso_log_adif(void)
     if (fclose(f) != 0) ok = false;
     if (ok) {
         s_auto_logged = true;
+        ft8_b4_invalidate();
         snprintf(s_auto_status, sizeof s_auto_status, "QSO DONE - SAVED /sdcard/FT8/ft8.adi");
     } else snprintf(s_auto_status, sizeof s_auto_status, "QSO DONE - ADIF WRITE FAILED");
 }
@@ -887,6 +889,129 @@ static void ft8_log_parse(const char *line, ft8_log_entry_t *e)
     ft8_log_field(line, "FREQ", e->freq, sizeof e->freq);
     ft8_log_field(line, "RST_SENT", e->sent, sizeof e->sent);
     ft8_log_field(line, "RST_RCVD", e->rcvd, sizeof e->rcvd);
+}
+
+/* Worked-before lookup for FT8 CQ lines. The ADIF file is read only when
+ * the index is invalidated, never during decoding or per displayed CQ. */
+#define FT8_B4_CAPACITY 4096u
+#define FT8_B4_CALL_LEN 20
+typedef struct {
+    char call[FT8_B4_CALL_LEN];
+    uint8_t band;
+} ft8_b4_entry_t;
+static ft8_b4_entry_t *s_ft8_b4_table;
+static bool s_ft8_b4_loaded;
+static TickType_t s_ft8_b4_retry_at;
+
+static uint8_t ft8_b4_band(double mhz)
+{
+    if (mhz >= 1.8 && mhz < 2.0) return 1;
+    if (mhz >= 3.5 && mhz < 4.0) return 2;
+    if (mhz >= 5.0 && mhz < 5.5) return 3;
+    if (mhz >= 7.0 && mhz < 7.3) return 4;
+    if (mhz >= 10.0 && mhz < 10.2) return 5;
+    if (mhz >= 14.0 && mhz < 14.35) return 6;
+    if (mhz >= 18.0 && mhz < 18.2) return 7;
+    if (mhz >= 21.0 && mhz < 21.45) return 8;
+    if (mhz >= 24.8 && mhz < 25.0) return 9;
+    if (mhz >= 28.0 && mhz < 30.0) return 10;
+    if (mhz >= 50.0 && mhz < 54.0) return 11;
+    if (mhz >= 70.0 && mhz < 71.0) return 12;
+    if (mhz >= 144.0 && mhz < 148.0) return 13;
+    if (mhz >= 430.0 && mhz < 440.0) return 14;
+    return 0;
+}
+
+static uint32_t ft8_b4_hash(const char *call, uint8_t band)
+{
+    uint32_t h = 2166136261u ^ band;
+    while (*call) { h = (h ^ (uint8_t)*call++) * 16777619u; }
+    return h % FT8_B4_CAPACITY;
+}
+
+static bool ft8_b4_find(const char *call, uint8_t band)
+{
+    if (!s_ft8_b4_loaded || !s_ft8_b4_table || !band) return false;
+    uint32_t pos = ft8_b4_hash(call, band);
+    for (uint32_t i = 0; i < FT8_B4_CAPACITY; i++) {
+        const ft8_b4_entry_t *e = &s_ft8_b4_table[pos];
+        if (!e->call[0]) return false;
+        if (e->band == band && !strcmp(e->call, call)) return true;
+        pos = (pos + 1) % FT8_B4_CAPACITY;
+    }
+    return false;
+}
+
+static void ft8_b4_insert(const char *call, uint8_t band)
+{
+    if (!s_ft8_b4_table || !band || !*call || strlen(call) >= FT8_B4_CALL_LEN) return;
+    uint32_t pos = ft8_b4_hash(call, band);
+    for (uint32_t i = 0; i < FT8_B4_CAPACITY; i++) {
+        ft8_b4_entry_t *e = &s_ft8_b4_table[pos];
+        if (!e->call[0]) {
+            snprintf(e->call, sizeof e->call, "%s", call);
+            e->band = band;
+            return;
+        }
+        if (e->band == band && !strcmp(e->call, call)) return;
+        pos = (pos + 1) % FT8_B4_CAPACITY;
+    }
+    ESP_LOGW(TAG, "FT8 B4 index full; some worked calls may be unmarked");
+}
+
+static void ft8_b4_invalidate(void)
+{
+    s_ft8_b4_loaded = false;
+    s_ft8_b4_retry_at = 0;
+    s_panel_mode = -1;
+}
+
+static void ft8_b4_ensure_loaded(void)
+{
+    if (s_ft8_b4_loaded) return;
+    TickType_t now = xTaskGetTickCount();
+    if (s_ft8_b4_retry_at && (int32_t)(now - s_ft8_b4_retry_at) < 0) return;
+    if (!s_ft8_b4_table) {
+        s_ft8_b4_table = calloc(FT8_B4_CAPACITY, sizeof *s_ft8_b4_table);
+        if (!s_ft8_b4_table) {
+            ESP_LOGW(TAG, "FT8 B4 index allocation failed");
+            s_ft8_b4_retry_at = now + pdMS_TO_TICKS(10000);
+            return;
+        }
+    }
+    FILE *f = fopen(FT8_LOG_PATH, "r");
+    if (!f) {
+        if (errno == ENOENT) {
+            /* No contacts yet: treat every CQ as new. */
+            memset(s_ft8_b4_table, 0, FT8_B4_CAPACITY * sizeof *s_ft8_b4_table);
+            s_ft8_b4_loaded = true;
+            s_panel_mode = -1;
+        } else s_ft8_b4_retry_at = now + pdMS_TO_TICKS(10000);
+        return;
+    }
+    memset(s_ft8_b4_table, 0, FT8_B4_CAPACITY * sizeof *s_ft8_b4_table);
+    char line[FT8_LOG_LINE], call[FT8_B4_CALL_LEN], freq[24];
+    while (fgets(line, sizeof line, f)) {
+        if (!strstr(line, "<EOR>") && !strstr(line, "<eor>")) continue;
+        ft8_log_field(line, "CALL", call, sizeof call);
+        ft8_log_field(line, "FREQ", freq, sizeof freq);
+        if (!call[0] || !freq[0]) continue;
+        for (char *p = call; *p; ++p) if (*p >= 'a' && *p <= 'z') *p -= 32;
+        char *freq_end = NULL;
+        double mhz = strtod(freq, &freq_end);
+        if (freq_end == freq || !isfinite(mhz)) continue;
+        while (*freq_end == ' ' || *freq_end == '\t') ++freq_end;
+        if (*freq_end) continue;
+        ft8_b4_insert(call, ft8_b4_band(mhz));
+    }
+    bool ok = !ferror(f);
+    fclose(f);
+    if (!ok) {
+        s_ft8_b4_retry_at = now + pdMS_TO_TICKS(10000);
+        return;
+    }
+    s_ft8_b4_loaded = true;
+    s_panel_mode = -1;
 }
 
 static void ft8_log_refresh(void)
@@ -957,6 +1082,7 @@ static bool ft8_log_delete(int index)
         return false;
     }
     remove(backup);
+    ft8_b4_invalidate();
     return true;
 }
 
@@ -1098,15 +1224,41 @@ static bool ft8_is_cq_message(const char *msg)
     return msg && !strncmp(msg, "CQ ", 3);
 }
 
-/* Return displayed messages oldest-first, with the same order as the panel. */
+/* Show only messages from the latest decoded FT8 period.  The same filtered
+ * array is used for drawing and touch selection, so row mapping stays correct.
+ * This does not change the decoder history used by AUTO SEQ. */
+static uint32_t s_ft8_visible_period_revision;
+static uint32_t s_ft8_visible_period_last_total = UINT32_MAX;
+static uint32_t s_ft8_visible_period_last_utc;
+static uint16_t s_ft8_visible_period_last_slot;
+static int s_ft8_visible_period_last_count = -1;
+
 static int ft8_visible_messages(ft8_msg_t *out, int capacity, ft8_status_t *st)
 {
     ft8_msg_t all[PANEL_COLS * PANEL_ROWS];
     int n = ft8_get_messages(all, PANEL_COLS * PANEL_ROWS, st);
     int count = 0;
+    uint32_t latest_utc = n > 0 ? all[n - 1].utc_slot : 0;
+    uint16_t latest_slot = n > 0 ? all[n - 1].slot : 0;
     for (int i = 0; i < n; ++i) {
+        /* utc_slot is authoritative when available; slot is the fallback
+         * for early decodes before the UTC clock has synchronized. */
+        bool same_period = latest_utc && all[i].utc_slot
+            ? all[i].utc_slot == latest_utc
+            : all[i].slot == latest_slot;
+        if (!same_period) continue;
         if (s_ft8_cq_only && !ft8_is_cq_message(all[i].text)) continue;
         if (count < capacity) out[count++] = all[i];
+    }
+    if (st->total != s_ft8_visible_period_last_total ||
+        latest_utc != s_ft8_visible_period_last_utc ||
+        latest_slot != s_ft8_visible_period_last_slot ||
+        count != s_ft8_visible_period_last_count) {
+        s_ft8_visible_period_last_total = st->total;
+        s_ft8_visible_period_last_utc = latest_utc;
+        s_ft8_visible_period_last_slot = latest_slot;
+        s_ft8_visible_period_last_count = count;
+        ++s_ft8_visible_period_revision;
     }
     return count;
 }
@@ -1817,10 +1969,19 @@ static void ft8_draw_back_button(void)
 
 static void draw_ft8_panel(void)
 {
+    /* Force CQ colour refresh whenever the tuned band changes, even if the
+     * decoder message count remains identical after retuning. */
+    static uint8_t last_b4_band = 255;
+    uint8_t current_b4_band = ft8_b4_band((double)s_center / 1000000.0);
+    if (last_b4_band != current_b4_band) {
+        last_b4_band = current_b4_band;
+        s_panel_mode = -1;
+    }
+    ft8_b4_ensure_loaded();
     ft8_msg_t msgs[PANEL_COLS * PANEL_ROWS];
     ft8_status_t st;
     int n = ft8_visible_messages(msgs, PANEL_COLS * PANEL_ROWS, &st); /* oldest first */
-    bool body = panel_begin(DSP_MODE_FT8, st.total);
+    bool body = panel_begin(DSP_MODE_FT8, s_ft8_visible_period_revision);
 
     char b[100];
     if (st.locked)
@@ -1832,7 +1993,7 @@ static void draw_ft8_panel(void)
     if (!body) { ft8_draw_back_button(); ft8_draw_filter_button(); return; }
 
     if (n == 0) {
-        text(6, WF_Y0 + 3 + PANEL_HDR_H, 1, RGB565(170, 170, 170), s_ft8_cq_only ? "NO CQ CALLS IN RECENT DECODED MESSAGES" : "NO MESSAGES YET. TUNE TO AN FT8 FREQUENCY IN USB,");
+        text(6, WF_Y0 + 3 + PANEL_HDR_H, 1, RGB565(170, 170, 170), s_ft8_cq_only ? "NO CQ CALLS IN LAST DECODED PERIOD" : "NO MESSAGES YET. TUNE TO AN FT8 FREQUENCY IN USB,");
         text(6, WF_Y0 + 3 + PANEL_HDR_H + 10, 1, RGB565(170, 170, 170), s_ft8_cq_only ? "PRESS CQ TO RETURN TO ALL MESSAGES" : "E.G. 14.074 MHZ (20 M). THE FIRST DECODE SETS THE SLOT TIMING.");
         ft8_draw_back_button(); ft8_draw_filter_button();
         return;
@@ -1843,7 +2004,21 @@ static void draw_ft8_panel(void)
         const ft8_msg_t *m = &msgs[n - 1 - k]; /* k = 0 is the newest */
         snprintf(b, sizeof b, "%4d %+3d %.*s", (int)m->freq, (int)m->snr, PANEL_TEXT_CH, m->text);
         uint16_t color = (m->slot == newest_slot) ? RGB565(235, 235, 235) : RGB565(120, 120, 120);
-        if (m->slot == newest_slot && m->text[0] == 'C' && m->text[1] == 'Q') color = RGB565(255, 220, 0); /* CQ calls */
+        if (ft8_is_cq_message(m->text)) {
+            char cq_call[FT8_B4_CALL_LEN] = "";
+            char a[20] = "", bcall[20] = "", ccall[20] = "";
+            int parts = sscanf(m->text, "%19s %19s %19s", a, bcall, ccall);
+            const char *candidate = (parts >= 3 && (!strcmp(bcall, "DX") ||
+                !strcmp(bcall, "TEST"))) ? ccall : (parts >= 2 ? bcall : "");
+            if (*candidate && strlen(candidate) < sizeof cq_call &&
+                strpbrk(candidate, "0123456789") && strpbrk(candidate, "ABCDEFGHIJKLMNOPQRSTUVWXYZ"))
+                snprintf(cq_call, sizeof cq_call, "%s", candidate);
+            if (cq_call[0] && s_ft8_b4_loaded && current_b4_band)
+                color = ft8_b4_find(cq_call, current_b4_band) ?
+                    RGB565(255, 145, 145) : RGB565(70, 255, 110);
+            else if (m->slot == newest_slot)
+                color = RGB565(255, 220, 0); /* Unknown: retain existing yellow */
+        }
         panel_line(k, n, color, b);
     }
     ft8_draw_back_button(); ft8_draw_filter_button();

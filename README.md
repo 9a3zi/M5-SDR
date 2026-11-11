@@ -39,6 +39,8 @@ strength, and firmware version. Features described here reflect the project impl
 - **Fast QSO start (experimental):** after a sufficiently prompt CQ selection, the firmware attempts to use the current suitable TX slot; otherwise it waits for the next matching slot. Late starts may not decode reliably.
 - The QSO history distinguishes RX and TX messages; completed QSOs are written to an **ADIF** file on the SD card.
 - The FT8 log viewer supports browsing and deleting selected saved QSOs.
+- 
+The log is now checked to see whether a contact has already been made on that band; if so, the CQ call appears in red, and if not, it appears in green.
 
 **Transmit warning:** This is an experimental RF implementation, not a finished certified transceiver. Use appropriate filtering, amplification/attenuation, antenna switching, dummy-load testing, time synchronization and amateur-radio authorization. Never connect an unfiltered Si5351 output directly to an antenna. See [FT8 QSO and TX](#ft8-qso-and-tx).
 
