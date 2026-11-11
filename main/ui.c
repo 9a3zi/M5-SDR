@@ -1313,7 +1313,39 @@ static bool qso_auto_tick(void)
     int64_t next_tx_slot = slot;
     if (s_auto_last_queued_slot == next_tx_slot) return changed;
     if (s_auto_attempts >= 5) {
-        qso_auto_off("AUTO STOP: NO RESPONSE AFTER 5 TX");
+        /* No reply after the configured number of attempts. If AUTO CQ is
+         * enabled, abandon only this QSO and resume CQ on the original
+         * CQ parity. Do not turn off the AUTO CQ user preference. */
+        if (s_auto_cq) {
+            s_auto = false;
+            s_auto_done = false;
+            s_auto_final_queued = false;
+            s_auto_final_started = false;
+            s_auto_attempts = 0;
+            s_auto_fast_first = false;
+            s_auto_last_queued_slot = -1;
+            s_qso_has_selected = false;
+            s_qso_wait_cq = false;
+            s_qso_own_cq = false;
+            s_qso_call[0] = 0;
+            s_qso_history_n = 0;
+            s_qso_history_last_seq = 0;
+            s_qso_tx_pending = false;
+            s_qso_tx_seen = false;
+            s_qso_tx_step = -1;
+            s_qso_error = false;
+            ft8_set_qso_focus(NULL, 0);
+            s_cq_active = true;
+            s_cq_last_queued_slot = -1;
+            s_cq_seen_count = 0;
+            s_cq_last_rx_seq = s_auto_last_seq;
+            snprintf(s_cq_debug, sizeof s_cq_debug,
+                     "AUTO CQ - QSO TIMEOUT, WAIT NEXT TX SLOT");
+            snprintf(s_auto_status, sizeof s_auto_status,
+                     "NO RESPONSE AFTER 5 TX - AUTO CQ RESUMED");
+        } else {
+            qso_auto_off("AUTO STOP: NO RESPONSE AFTER 5 TX");
+        }
         return true;
     }
     char to[16], from[16], extra[16];
@@ -1376,22 +1408,11 @@ static bool cq_tick(void)
         snprintf(s_cq_debug, sizeof s_cq_debug, "MATCH: %.54s", m->text);
         pending_reply = *m;
         reply_pending = true;
-        /* Cancel even an already-transmitting CQ. After the worker has
-         * fully muted CLK0 and released the relay, cq_tick() will arm
-         * the directed QSO reply. qso_auto_tick() can then use this same
-         * TX slot if less than one second has elapsed. */
-        si5351_tone_test_stop();
+        /* Keep the current CQ TX running: replace remaining symbols with
+         * the QSO reply, retaining the original UTC symbol timeline. */
 
     }
     if (reply_pending) {
-        /* Never queue another CQ after seeing a directed reply. */
-        if (si5351_tone_test_running() || si5351_relay_is_tx()) {
-            /* Stop also covers the already queued next CQ. The Si5351 worker
-             * clears its running state after honoring the stop request. */
-            si5351_tone_test_stop();
-            snprintf(s_auto_status, sizeof s_auto_status, "CQ REPLY FOUND - CANCEL CQ TX");
-            return true;
-        }
         const ft8_msg_t *m = &pending_reply;
         char call[sizeof s_qso_call];
         if (!qso_extract_call(m->text, call, sizeof call)) {
@@ -1441,6 +1462,28 @@ static bool cq_tick(void)
         s_qso_start_utc = 0;
         ft8_set_qso_focus(s_qso_call, (int)m->freq);
         qso_prepare();
+        /* The CQ worker may already be on air. Switch its encoded tones at
+         * the next symbol boundary, without dropping relay or restarting.
+         * The existing frame ends at its original UTC time. */
+        if (si5351_tone_test_running()) {
+            char tx_to[16], tx_from[16], tx_extra[16];
+            if (sscanf(s_qso_preview, "%15s %15s %15s", tx_to, tx_from, tx_extra) == 3 &&
+                si5351_ft8_replace_active_message(tx_to, tx_from, tx_extra) == ESP_OK) {
+                struct timeval sw_tv;
+                gettimeofday(&sw_tv, NULL);
+                s_auto_last_queued_slot = (int64_t)sw_tv.tv_sec / 15;
+                s_auto_attempts = 1;
+                qso_history_queue_tx();
+                if (!s_qso_start_utc) s_qso_start_utc = sw_tv.tv_sec;
+                if (s_qso_step == 2)
+                    snprintf(s_qso_rst_sent, sizeof s_qso_rst_sent, "%.7s", tx_extra + 1);
+                else if (s_qso_step == 1)
+                    snprintf(s_qso_rst_sent, sizeof s_qso_rst_sent, "%.7s", tx_extra);
+                snprintf(s_auto_status, sizeof s_auto_status,
+                         "CQ REPLY %.15s - SWITCH TX NOW", s_qso_call);
+                return true;
+            }
+        }
         snprintf(s_auto_status, sizeof s_auto_status,
                  "CQ ANSWER %.15s - AUTO REPORT NEXT", s_qso_call);
         return true;
@@ -1549,7 +1592,7 @@ static void qso_draw(void)
     text(183, 275, 1, COL_LINE, b);
     rect(480, 256, 148, 27, s_auto_cq ? COL_ACCENT : COL_BTN);
     text(490, 265, 1, s_auto_cq ? COL_BG : COL_TEXT,
-         s_auto_cq ? "AUTO QSO CQ: ON" : "AUTO QSO CQ: OFF");
+         s_auto_cq ? "AUTO CQ: ON" : "AUTO CQ: OFF");
     rect(12, 299, 142, 51, COL_BTN);
     text(49, 317, 2, COL_TEXT, "SEND");
     rect(168, 299, 142, 51, COL_BTN);
@@ -1643,8 +1686,8 @@ static bool qso_touch(int x, int y)
     if (y >= 299 && y < 350) {
         if (x >= 12 && x < 154 && s_qso_has_selected && !s_cq_active) {
             /* Manual SEND joins the current FT8 slot, skipping elapsed symbols. */
-            if (si5351_tone_test_running() || si5351_relay_is_tx()) {
-                snprintf(s_auto_status, sizeof s_auto_status, "SEND: TX ALREADY QUEUED/ACTIVE");
+            if (si5351_relay_is_tx() || si5351_tone_test_index() >= 0) {
+                snprintf(s_auto_status, sizeof s_auto_status, "SEND: TX ALREADY ACTIVE");
                 return true;
             }
             if (s_qso_wait_cq) {
@@ -1659,9 +1702,17 @@ static bool qso_touch(int x, int y)
             }
             char to[16], from[16], extra[16];
             if (sscanf(s_qso_preview, "%15s %15s %15s", to, from, extra) == 3) {
-                esp_err_t err = qso_sync_tx_frequency();
-                if (err == ESP_OK) err = si5351_ft8_set_message(to, from, extra);
-                if (err == ESP_OK) err = si5351_tone_test_start_immediate();
+                bool queued_auto = si5351_tone_test_running();
+                esp_err_t err = ESP_OK;
+                if (queued_auto) {
+                    /* AUTO has queued a future frame: replace it with a late
+                     * manual SEND, keeping the original UTC symbol timeline. */
+                    err = si5351_ft8_takeover_queued_send(to, from, extra);
+                } else {
+                    err = qso_sync_tx_frequency();
+                    if (err == ESP_OK) err = si5351_ft8_set_message(to, from, extra);
+                    if (err == ESP_OK) err = si5351_tone_test_start_immediate();
+                }
                 if (err == ESP_OK) {
                     qso_history_queue_tx();
                     /* A manual late SEND occupies the CURRENT UTC TX slot,

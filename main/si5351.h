@@ -15,10 +15,14 @@ esp_err_t si5351_set_frequency_cHz(uint64_t freq_cHz);
 esp_err_t si5351_ft8_set_message(const char *to, const char *from, const char *extra);
 const char *si5351_ft8_get_message(void);
 esp_err_t si5351_tone_test_start(void);
+/* Change an ongoing CQ to a QSO reply without restarting the FT8 frame. */
+esp_err_t si5351_ft8_replace_active_message(const char *to, const char *from, const char *extra);
 /* TX only on UTC 15-second slots with specified parity (0 or 1). */
 esp_err_t si5351_tone_test_start_parity(int parity);
 /* Manual SEND: start late in the current UTC slot, skipping elapsed symbols. */
 esp_err_t si5351_tone_test_start_immediate(void);
+/* Manual SEND overrides a queued (not transmitting) AUTO frame. */
+esp_err_t si5351_ft8_takeover_queued_send(const char *to, const char *from, const char *extra);
 void si5351_tone_test_stop(void);
 bool si5351_tone_test_running(void);
 bool si5351_relay_is_tx(void);
