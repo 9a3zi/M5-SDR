@@ -349,7 +349,7 @@ of the number of transmitted packets**. Invalid frames are not displayed as vali
 ## Network reporting
 
 The firmware includes network reporting capabilities for supported digital modes. Configure Wi-Fi and station identification 
-in `net_cfg.h` before building. Reporting behavior and destination services depend on the enabled mode and firmware configuration; 
+in PLAN/SETTINGS after building. Reporting behavior and destination services depend on the enabled mode and firmware configuration; 
 consult the source and settings for the exact upload paths.
 
 ## Project layout
