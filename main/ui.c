@@ -7,7 +7,7 @@
  *
  * Controls: drag spectrum/waterfall to scan fast; [-1][-.1][+.1][+1] tune;
  * mode row WFM/NFM/AM/USB/LSB/CW/FT8/WSPR, RS41 button (press again = centre on peak);
- * HF/VHF/UHF band buttons; PLAN button: time-scheduled band hopping for
+ * HF/VHF/UHF band buttons; MENU button: time-scheduled band hopping for
  * FT8/WSPR (menu: OFF / FT8 PLAN / WSPR PLAN / USER PLAN / editor / SCREEN OFF);
  * volume +/- ; squelch +/-. The SCREEN OFF row sets the display-off (screensaver)
  * delay; after the idle timeout the backlight turns off and any touch wakes it.
@@ -1375,8 +1375,8 @@ static bool qso_auto_tick(void)
                 s_qso_tx_step = -1;
                 s_auto_fast_first = false;
                 ft8_set_qso_focus(NULL, 0);
-                snprintf(s_cq_debug, sizeof s_cq_debug, "AUTO CQ - WAIT NEXT TX SLOT");
-                snprintf(s_auto_status, sizeof s_auto_status, "QSO DONE - AUTO CQ RESUMED");
+                snprintf(s_cq_debug, sizeof s_cq_debug, "AUTO QSO - WAIT NEXT TX SLOT");
+                snprintf(s_auto_status, sizeof s_auto_status, "QSO DONE - AUTO QSO RESUMED");
             }
             return true;
         }
@@ -1465,9 +1465,9 @@ static bool qso_auto_tick(void)
     int64_t next_tx_slot = slot;
     if (s_auto_last_queued_slot == next_tx_slot) return changed;
     if (s_auto_attempts >= 5) {
-        /* No reply after the configured number of attempts. If AUTO CQ is
+        /* No reply after the configured number of attempts. If AUTO QSO is
          * enabled, abandon only this QSO and resume CQ on the original
-         * CQ parity. Do not turn off the AUTO CQ user preference. */
+         * CQ parity. Do not turn off the AUTO QSO user preference. */
         if (s_auto_cq) {
             s_auto = false;
             s_auto_done = false;
@@ -1492,9 +1492,9 @@ static bool qso_auto_tick(void)
             s_cq_seen_count = 0;
             s_cq_last_rx_seq = s_auto_last_seq;
             snprintf(s_cq_debug, sizeof s_cq_debug,
-                     "AUTO CQ - QSO TIMEOUT, WAIT NEXT TX SLOT");
+                     "AUTO QSO - QSO TIMEOUT, WAIT NEXT TX SLOT");
             snprintf(s_auto_status, sizeof s_auto_status,
-                     "NO RESPONSE AFTER 5 TX - AUTO CQ RESUMED");
+                     "NO RESPONSE AFTER 5 TX - AUTO QSO RESUMED");
         } else {
             qso_auto_off("AUTO STOP: NO RESPONSE AFTER 5 TX");
         }
@@ -1744,7 +1744,7 @@ static void qso_draw(void)
     text(183, 275, 1, COL_LINE, b);
     rect(480, 256, 148, 27, s_auto_cq ? COL_ACCENT : COL_BTN);
     text(490, 265, 1, s_auto_cq ? COL_BG : COL_TEXT,
-         s_auto_cq ? "AUTO CQ: ON" : "AUTO CQ: OFF");
+         s_auto_cq ? "AUTO QSO: ON" : "AUTO QSO: OFF");
     rect(12, 299, 142, 51, COL_BTN);
     text(49, 317, 2, COL_TEXT, "SEND");
     rect(168, 299, 142, 51, COL_BTN);
@@ -1806,7 +1806,7 @@ static bool qso_touch(int x, int y)
     if (y >= 256 && y < 283 && x >= 480 && x < 628) {
         s_auto_cq = !s_auto_cq;
         snprintf(s_auto_status, sizeof s_auto_status, "%s",
-                 s_auto_cq ? "AUTO CQ ENABLED" : "AUTO CQ DISABLED");
+                 s_auto_cq ? "AUTO QSO ENABLED" : "AUTO QSO DISABLED");
         return true;
     }
     if (y >= 256 && y < 283 && x >= 12 && x < 172 && s_qso_has_selected && !s_cq_active) {
