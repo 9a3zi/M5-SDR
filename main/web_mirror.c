@@ -14,12 +14,15 @@
 #define MW 640
 #define MH 360
 #define FRAME_BYTES (MW * MH * 2)
+/* Keep framebuffer copies active briefly after the last viewer request. */
+#define MIRROR_CLIENT_TIMEOUT_US 3000000LL
 static const char *TAG = "mirror";
 static uint16_t *s_frame;
 static SemaphoreHandle_t s_lock;
 static volatile int s_x, s_y, s_down;
 static volatile int64_t s_event_us;
 static int64_t s_last_frame_us;
+static volatile int64_t s_last_client_us;
 static httpd_handle_t s_server;
 static httpd_handle_t s_touch_server;
 static uint16_t *s_previous_frame;
@@ -60,6 +63,8 @@ static esp_err_t delta_get(httpd_req_t *req) {
     if (httpd_req_get_url_query_str(req, query, sizeof query) != ESP_OK ||
         sscanf(query, "client=%u&reset=%u", &client, &reset) != 2 || client == 0)
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid client");
+    /* A /delta request is the viewer heartbeat; no separate polling task. */
+    s_last_client_us = esp_timer_get_time();
     if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(30)) != pdTRUE) {
         httpd_resp_set_status(req, "503 Service Unavailable");
         return httpd_resp_sendstr(req, "busy");
@@ -133,6 +138,8 @@ void web_mirror_start(void) {
     if (!s_lock || !s_frame || !s_previous_frame || !s_delta_packet) { ESP_LOGE(TAG, "No memory for mirror frame"); return; }
     memset(s_frame, 0, FRAME_BYTES);
     s_delta_valid = false;
+    s_last_client_us = 0;
+    s_last_frame_us = 0;
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port = 80;
     cfg.stack_size = 6144;
@@ -159,6 +166,9 @@ void web_mirror_start(void) {
 void web_mirror_publish(const uint16_t *pixels) {
     if (!s_enabled || !s_server || !s_frame || !pixels || !s_lock) return;
     int64_t now = esp_timer_get_time();
+    /* Without a recent /delta request, avoid the 450 KiB framebuffer copy. */
+    int64_t last_client = s_last_client_us;
+    if (!last_client || now - last_client > MIRROR_CLIENT_TIMEOUT_US) return;
     if (now - s_last_frame_us < 100000) return;
     if (xSemaphoreTake(s_lock, 0) != pdTRUE) return;
     memcpy(s_frame, pixels, FRAME_BYTES);
@@ -187,6 +197,7 @@ void web_mirror_set_enabled(bool enabled) {
     if (!enabled) {
         s_enabled = false;
         s_event_us = 0;
+        s_last_client_us = 0;
         if (s_touch_server) { httpd_stop(s_touch_server); s_touch_server = NULL; }
         if (s_server) { httpd_stop(s_server); s_server = NULL; }
         ESP_LOGI(TAG, "Web Mirror stopped");
