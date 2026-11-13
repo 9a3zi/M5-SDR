@@ -24,25 +24,26 @@ strength, and firmware version. Features described here reflect the project impl
 | Mode | Function | Typical frequency / band |
 | --- | --- | --- |
 | **FT8** | Decodes weak-signal amateur radio messages; shows frequency, SNR, DT and text | 14.074 MHz (20 m), plus other amateur bands |
+| **FT4** | Decodes weak-signal amateur radio messages; shows frequency, SNR, DT and text | 14.080 MHz (20 m), plus other amateur bands |
 | **WSPR** | Decodes propagation beacons; shows callsign, locator and transmit power | 14.0956 MHz (20 m), plus other amateur bands |
 | **RS41** | Decodes supported Vaisala radiosonde telemetry | 400–406 MHz |
 | **HORUS** | Horus Binary v1, v2 and v3 telemetry decoding | Tune to the balloon's transmit frequency |
 | **LoRa APRS** | Receives LoRa APRS using an external RA-02 module | According to the configured LoRa APRS channel | automatic scan sonde band | recording data to sd card |
 | **APRS (AFSK1200)** | Bell 202 / AX.25 packet decoding with packet history and CRC diagnostics | 144.800 MHz / 432.500 MHz presets |
 
-### FT8 QSO and experimental transmission
+### FT8 and FT4 QSO and experimental transmission
 
-- Touch a decoded **CQ** station in the FT8 message list to open the **QSO** window.
+- Touch a decoded **CQ** station in the FT8/FT4 message list to open the **QSO** window.
 - The selected callsign, received-message frequency and opposite TX slot are used to prepare a reply.
 - **AUTO SEQ** manages the normal QSO exchange; **STOP** disables automatic transmission.
-- A connected **Si5351** synthesizer generates the FT8 RF tones. A TX/RX relay switches the antenna path.
+- A connected **Si5351** synthesizer generates the FT8/FT4 RF tones. A TX/RX relay switches the antenna path.
 - **Fast QSO start (experimental):** after a sufficiently prompt CQ selection, the firmware attempts to use the current suitable TX slot; otherwise it waits for the next matching slot. Late starts may not decode reliably.
 - The QSO history distinguishes RX and TX messages; completed QSOs are written to an **ADIF** file on the SD card.
 - The FT8 log viewer supports browsing and deleting selected saved QSOs.
 - 
 The log is now checked to see whether a contact has already been made on that band; if so, the CQ call appears in red, and if not, it appears in green.
 
-**Transmit warning:** This is an experimental RF implementation, not a finished certified transceiver. Use appropriate filtering, amplification/attenuation, antenna switching, dummy-load testing, time synchronization and amateur-radio authorization. Never connect an unfiltered Si5351 output directly to an antenna. See [FT8 QSO and TX](#ft8-qso-and-tx).
+**Transmit warning:** This is an experimental RF implementation, not a finished certified transceiver. Use appropriate filtering, amplification/attenuation, antenna switching, dummy-load testing, time synchronization and amateur-radio authorization. Never connect an unfiltered Si5351 output directly to an antenna. See [FT8/FT4 QSO and TX](#ft8/ft4-qso-and-tx).
 
 ### Display and automation
 

@@ -29,6 +29,9 @@ bool si5351_relay_is_tx(void);
 esp_err_t si5351_ft8_set_base_cHz(uint64_t base_chz);
 uint64_t si5351_ft8_get_base_cHz(void);
 int si5351_tone_test_index(void);
+/* FT4 transmit backend; FT4 parity is based on 7.5-second UTC slots. */
+esp_err_t si5351_ft4_set_message(const char *to, const char *from, const char *extra);
+esp_err_t si5351_ft4_start_parity(int parity);
 #ifdef __cplusplus
 }
 #endif

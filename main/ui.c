@@ -43,6 +43,7 @@
 #include "rs41.h"
 #include "rs41_font.h"
 #include "ft8.h"
+#include "ft4.h"
 #include "wspr.h"
 #include "audio.h"
 #include "bookmarks.h"
@@ -378,6 +379,7 @@ static uint16_t mode_color(int m)
     case DSP_MODE_CW:  return RGB565(200, 160, 255);
     case DSP_MODE_RS41: return RGB565(255, 90, 90);
     case DSP_MODE_FT8:  return RGB565(60, 220, 200);
+    case DSP_MODE_FT4:  return RGB565(80, 210, 170);
     case DSP_MODE_WSPR: return RGB565(240, 170, 80);
     case DSP_MODE_HORUS: return RGB565(140, 220, 120);
     case DSP_MODE_APRS: return RGB565(90, 220, 245);
@@ -559,7 +561,7 @@ static void draw_rs41_panel(void)
 #define PANEL_TEXT_CH 26                /* characters left for the text after "1523 -12 " */
 #define PANEL_HDR_H   11
 
-static inline bool is_panel_mode(int m) { return m == DSP_MODE_RS41 || m == DSP_MODE_FT8 || m == DSP_MODE_WSPR; }
+static inline bool is_panel_mode(int m) { return m == DSP_MODE_RS41 || m == DSP_MODE_FT8 || m == DSP_MODE_FT4 || m == DSP_MODE_WSPR; }
 
 /* Prepare the panel: clears what is needed. Returns true if the body must be (re)drawn. */
 static bool panel_begin(int mode, uint32_t total)
@@ -726,10 +728,11 @@ static void qso_history_add(const char *message, bool tx, int snr)
 
 static bool qso_history_rx_tick(void)
 {
-    if ((!s_qso_has_selected && !s_cq_active) || s_mode != DSP_MODE_FT8) return false;
+    if ((!s_qso_has_selected && !s_cq_active) ||
+        (s_mode != DSP_MODE_FT8 && s_mode != DSP_MODE_FT4)) return false;
     ft8_msg_t msgs[24];
     ft8_status_t st;
-    int n = ft8_get_messages(msgs, 24, &st);
+    int n = s_mode == DSP_MODE_FT4 ? ft4_get_messages(msgs, 24, &st) : ft8_get_messages(msgs, 24, &st);
     bool changed = false;
     for (int i = 0; i < n; i++) {
         const ft8_msg_t *m = &msgs[i];
@@ -748,7 +751,7 @@ static bool qso_history_rx_tick(void)
         qso_history_add(m->text, false, m->snr);
         /* While listening manually, a fresh CQ provides a valid TX slot
          * for a later manual SEND / AUTO ARM. Never transmit on detection. */
-        if (s_qso_has_selected && !s_auto && !strcmp(a, "CQ") && m->utc_slot) {
+        if (s_mode == DSP_MODE_FT8 && s_qso_has_selected && !s_auto && !strcmp(a, "CQ") && m->utc_slot) {
             struct timeval tv;
             gettimeofday(&tv, NULL);
             int64_t age = (int64_t)tv.tv_sec / 15 - (int64_t)m->utc_slot;
@@ -821,11 +824,12 @@ static void qso_log_adif(void)
     strftime(de, sizeof de, "%Y%m%d", &tm_end);
     strftime(te, sizeof te, "%H%M%S", &tm_end);
     snprintf(freq, sizeof freq, "%.6f", (double)s_qso_rf_base_chz / 100000000.0);
-    fprintf(f, "<CALL:%u>%s <STATION_CALLSIGN:%u>%s <MODE:3>FT8 "
+    fprintf(f, "<CALL:%u>%s <STATION_CALLSIGN:%u>%s <MODE:3>%s "
             "<QSO_DATE:8>%s <TIME_ON:6>%s <QSO_DATE_OFF:8>%s <TIME_OFF:6>%s "
             "<FREQ:%u>%s <RST_SENT:%u>%s <RST_RCVD:%u>%s <EOR>\n",
             (unsigned)strlen(s_qso_call), s_qso_call,
-            (unsigned)strlen(station_call()), station_call(), d, t, de, te,
+            (unsigned)strlen(station_call()), station_call(),
+            s_mode == DSP_MODE_FT4 ? "FT4" : "FT8", d, t, de, te,
             (unsigned)strlen(freq), freq,
             (unsigned)strlen(s_qso_rst_sent), s_qso_rst_sent,
             (unsigned)strlen(s_qso_rst_rcvd), s_qso_rst_rcvd);
@@ -846,7 +850,7 @@ static void qso_log_adif(void)
 #define FT8_LOG_LINE 768
 
 typedef struct {
-    char call[24], date[12], time_on[12], freq[24], sent[12], rcvd[12];
+    char call[24], date[12], time_on[12], freq[24], sent[12], rcvd[12], mode[8];
 } ft8_log_entry_t;
 static ft8_log_entry_t s_ft8_log_rows[FT8_LOG_ROWS];
 static int s_ft8_log_count, s_ft8_log_page, s_ft8_log_selected = -1;
@@ -884,6 +888,7 @@ static void ft8_log_parse(const char *line, ft8_log_entry_t *e)
 {
     memset(e, 0, sizeof *e);
     ft8_log_field(line, "CALL", e->call, sizeof e->call);
+    ft8_log_field(line, "MODE", e->mode, sizeof e->mode);
     ft8_log_field(line, "QSO_DATE", e->date, sizeof e->date);
     ft8_log_field(line, "TIME_ON", e->time_on, sizeof e->time_on);
     ft8_log_field(line, "FREQ", e->freq, sizeof e->freq);
@@ -1089,13 +1094,13 @@ static bool ft8_log_delete(int index)
 static void ft8_log_draw(void)
 {
     rect(0, 0, LW, LH, RGB565(10,14,30));
-    text(12, 8, 2, COL_ACCENT, "FT8 LOG - SD CARD");
+    text(12, 8, 2, COL_ACCENT, "FT8 / FT4 LOG - SD CARD");
     char b[128];
     snprintf(b, sizeof b, "TOTAL QSOS: %d     PAGE: %d/%d", s_ft8_log_count,
              s_ft8_log_page + 1, (s_ft8_log_count + FT8_LOG_ROWS - 1) / FT8_LOG_ROWS > 0 ?
              (s_ft8_log_count + FT8_LOG_ROWS - 1) / FT8_LOG_ROWS : 1);
     text(12, 38, 1, COL_LINE, b);
-    text(12, 63, 1, COL_ACCENT, "UTC DATE     TIME    CALL           MHz        SENT    RCVD");
+    text(12, 63, 1, COL_ACCENT, "UTC DATE   TIME   CALL          MODE   MHz       SENT RCVD");
     rect(10, 81, 620, 193, RGB565(17,25,43));
     int n = s_ft8_log_count - s_ft8_log_page * FT8_LOG_ROWS;
     if (n > FT8_LOG_ROWS) n = FT8_LOG_ROWS;
@@ -1103,8 +1108,9 @@ static void ft8_log_draw(void)
         const ft8_log_entry_t *e = &s_ft8_log_rows[i];
         int y = 85 + i * 23;
         if (s_ft8_log_selected == i) rect(12, y - 2, 616, 22, RGB565(38,70,91));
-        snprintf(b, sizeof b, "%.8s  %.6s  %-13.13s %-10.10s %-7.7s %-7.7s",
-                 e->date, e->time_on, e->call, e->freq, e->sent, e->rcvd);
+        snprintf(b, sizeof b, "%.8s %.6s %-12.12s %-4.4s %-9.9s %-4.4s %-4.4s",
+                 e->date, e->time_on, e->call, e->mode[0] ? e->mode : "?",
+                 e->freq, e->sent, e->rcvd);
         text(18, y + 3, 1, COL_TEXT, b);
     }
     if (!s_ft8_log_count) text(22, 115, 2, COL_LINE, "NO LOGGED QSOS YET");
@@ -1236,16 +1242,21 @@ static int s_ft8_visible_period_last_count = -1;
 static int ft8_visible_messages(ft8_msg_t *out, int capacity, ft8_status_t *st)
 {
     ft8_msg_t all[PANEL_COLS * PANEL_ROWS];
-    int n = ft8_get_messages(all, PANEL_COLS * PANEL_ROWS, st);
+    int n = s_mode == DSP_MODE_FT4 ? ft4_get_messages(all, PANEL_COLS * PANEL_ROWS, st) :
+            ft8_get_messages(all, PANEL_COLS * PANEL_ROWS, st);
     int count = 0;
     uint32_t latest_utc = n > 0 ? all[n - 1].utc_slot : 0;
     uint16_t latest_slot = n > 0 ? all[n - 1].slot : 0;
     for (int i = 0; i < n; ++i) {
         /* utc_slot is authoritative when available; slot is the fallback
          * for early decodes before the UTC clock has synchronized. */
-        bool same_period = latest_utc && all[i].utc_slot
-            ? all[i].utc_slot == latest_utc
-            : all[i].slot == latest_slot;
+        /* FT4 can have a mixture of UTC-tagged and untagged messages.
+         * Use its local decoded slot consistently, never mix domains. */
+        bool same_period = (s_mode == DSP_MODE_FT4)
+            ? (all[i].slot == latest_slot)
+            : (latest_utc && all[i].utc_slot
+                ? all[i].utc_slot == latest_utc
+                : all[i].slot == latest_slot);
         if (!same_period) continue;
         if (s_ft8_cq_only && !ft8_is_cq_message(all[i].text)) continue;
         if (count < capacity) out[count++] = all[i];
@@ -1305,7 +1316,8 @@ static bool qso_select_panel_row(int x, int y)
     s_cq_active = false; /* Selecting a station stops repeated CQ calls. */
     s_qso_own_cq = false; /* Answering another CQ follows their audio frequency. */
     s_qso_selected = *m;
-    ft8_set_qso_focus(call, (int)m->freq);
+    if (s_mode == DSP_MODE_FT4) ft4_set_qso_focus(call, (int)m->freq);
+    else ft8_set_qso_focus(call, (int)m->freq);
     snprintf(s_qso_call, sizeof s_qso_call, "%s", call);
     s_qso_history_n = 0;
     s_qso_history_last_seq = m->seq;
@@ -1319,7 +1331,11 @@ static bool qso_select_panel_row(int x, int y)
      * somebody else's QSO, even if AUTO SEQ was previously enabled. */
     bool selected_cq = !strncmp(m->text, "CQ ", 3);
     s_qso_wait_cq = !selected_cq;
-    s_auto = selected_cq && s_auto_enabled;
+    /* Selecting a fresh FT4 CQ immediately arms AUTO SEQ, just like FT8.
+     * Non-CQ rows remain monitor-only. The FT4 worker still verifies UTC
+     * parity and queues only in the preceding RX slot. */
+    s_auto = selected_cq && s_auto_enabled &&
+             (s_mode == DSP_MODE_FT8 || s_mode == DSP_MODE_FT4);
     s_auto_done = false;
     s_auto_logged = false;
     s_auto_final_queued = false;
@@ -1330,9 +1346,11 @@ static bool qso_select_panel_row(int x, int y)
      * early focused decodes do not have a fixed publication delay. */
     struct timeval sel_tv;
     gettimeofday(&sel_tv, NULL);
-    int64_t now_slot = (int64_t)sel_tv.tv_sec / 15;
+    int64_t now_slot = ((int64_t)sel_tv.tv_sec * 1000000LL + sel_tv.tv_usec) /
+                       (s_mode == DSP_MODE_FT4 ? 7500000LL : 15000000LL);
     int64_t rx_age = now_slot - (int64_t)m->utc_slot;
-    if (sel_tv.tv_sec >= 1760000000LL && m->utc_slot != 0 &&
+    if ((s_mode == DSP_MODE_FT8 || s_mode == DSP_MODE_FT4) &&
+        sel_tv.tv_sec >= 1760000000LL && m->utc_slot != 0 &&
         rx_age >= 0 && rx_age <= 2) {
         s_auto_tx_parity = (int)((m->utc_slot + 1u) & 1u);
         ESP_LOGI(TAG, "QSO %s: RX UTC slot %lu, age %lld, TX parity %d",
@@ -1344,15 +1362,19 @@ static bool qso_select_panel_row(int x, int y)
                  call, (unsigned long)m->utc_slot, (long long)rx_age);
     }
     s_auto_last_queued_slot = -1;
+    if (s_mode == DSP_MODE_FT4 && s_auto && s_auto_tx_parity < 0) {
+        /* Do not transmit without a verified opposite slot. */
+        s_auto = false;
+    }
     s_auto_fast_first = selected_cq && s_auto && s_auto_tx_parity >= 0;
     s_auto_last_seq = m->seq;
     s_qso_rst_sent[0] = s_qso_rst_rcvd[0] = 0;
     s_qso_start_utc = 0;
-    /* Tuning the TX generator is unnecessary while merely monitoring. */
+    /* On a fresh CQ, arm RF frequency immediately; monitoring stays passive. */
     s_qso_error = s_auto && (qso_sync_tx_frequency() != ESP_OK);
     snprintf(s_auto_status, sizeof s_auto_status, "%s",
              s_auto ? (s_auto_tx_parity < 0 ? "AUTO WAIT - SELECT FRESH CQ" : "AUTO ARMED - WAIT TX SLOT") :
-             (selected_cq ? "MONITORING CQ - AUTO OFF" : "MONITORING - WAIT FOR CQ"));
+             (selected_cq ? "CQ SELECTED - AUTO OFF" : "MONITORING - WAIT FOR CQ"));
     qso_prepare();
     s_qso_has_selected = true;
     return true;
@@ -1360,6 +1382,115 @@ static bool qso_select_panel_row(int x, int y)
 /* Called from the UI task even while the QSO menu is open. No transmission
  * starts unless AUTO was explicitly enabled. Repeats only on the same
  * 30-second parity; max 3 attempts for each message. */
+/* FT4 automatic QSO: schedule only the opposite 7.5 s parity.
+ * The FT4 Si5351 worker intentionally has no late-start path. Queue in the
+ * preceding RX slot, never inside the TX slot, to prevent crossed periods. */
+static bool ft4_auto_tick(void)
+{
+    if (!s_auto || !s_qso_has_selected || s_auto_done || s_mode != DSP_MODE_FT4) return false;
+    if (s_auto_final_queued) {
+        if (si5351_relay_is_tx() && si5351_tone_test_index() >= 0)
+            s_auto_final_started = true;
+        if (s_auto_final_started && !si5351_tone_test_running()) {
+            s_auto_final_queued = false;
+            s_auto_done = true;
+            s_auto = false;
+            qso_log_adif();
+            if (s_auto_cq) {
+                s_cq_active = true;
+                s_qso_has_selected = false;
+                s_qso_own_cq = false;
+                s_qso_call[0] = 0;
+                s_cq_last_queued_slot = -1;
+                ft8_msg_t cq_msgs[24];
+                ft8_status_t cq_st;
+                int cq_n = ft4_get_messages(cq_msgs, 24, &cq_st);
+                s_cq_last_rx_seq = cq_n ? cq_msgs[cq_n - 1].seq : 0;
+                ft4_set_qso_focus(NULL, 0);
+                snprintf(s_auto_status, sizeof s_auto_status, "FT4 QSO LOGGED - CQ RESUMED");
+            }
+            return true;
+        }
+        if (!s_auto_final_started && !si5351_tone_test_running()) {
+            s_auto_final_queued = false;
+            s_qso_error = true;
+            qso_auto_off("FT4 FINAL TX ABORTED");
+            return true;
+        }
+        return false;
+    }
+    bool changed = false;
+    ft8_msg_t msgs[24];
+    ft8_status_t st;
+    int n = ft4_get_messages(msgs, 24, &st);
+    for (int i = 0; i < n; ++i) {
+        const ft8_msg_t *m = &msgs[i];
+        if (m->seq <= s_auto_last_seq) continue;
+        s_auto_last_seq = m->seq;
+        char to[20] = "", from[20] = "", extra[20] = "";
+        if (sscanf(m->text, "%19s %19s %19s", to, from, extra) != 3) continue;
+        if (strcmp(to, station_call()) || strcmp(from, s_qso_call)) continue;
+        ft4_set_qso_focus(s_qso_call, (int)m->freq);
+        s_qso_selected = *m; /* refresh SNR and tracked TX audio offset */
+        changed = true;
+        if (qso_is_report(extra)) {
+            snprintf(s_qso_rst_rcvd, sizeof s_qso_rst_rcvd, "%.7s", extra[0] == 'R' ? extra + 1 : extra);
+            s_qso_step = extra[0] == 'R' ? 3 : 2;
+            s_auto_attempts = 0;
+            snprintf(s_auto_status, sizeof s_auto_status, "FT4 RX %s - NEXT %s", extra, s_qso_steps[s_qso_step]);
+        } else if (!strcmp(extra, "RR73") || !strcmp(extra, "73")) {
+            s_qso_step = 4;
+            s_auto_attempts = 0;
+            snprintf(s_auto_status, sizeof s_auto_status, "FT4 RX %s - FINAL 73", extra);
+        }
+    }
+    if (changed) qso_prepare();
+    if (si5351_tone_test_running() || s_auto_tx_parity < 0) return changed;
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    if (tv.tv_sec < 1760000000LL) return changed;
+    const int64_t utc_us = (int64_t)tv.tv_sec * 1000000LL + tv.tv_usec;
+    const int64_t slot = utc_us / 7500000LL;
+    const int64_t elapsed = utc_us % 7500000LL;
+    /* Queue as soon as the CQ is selected and AUTO SEQ is armed.
+     * Waiting until the last 1.2 s of RX can miss the next TX slot
+     * when the decode/UI arrives late. The Si5351 worker still starts
+     * only on the correct UTC slot parity. Avoid the last 0.5 s,
+     * where its scheduling guard intentionally advances a slot. */
+    if (((slot + 1) & 1LL) != s_auto_tx_parity ||
+        elapsed > 6900000LL) return changed;
+    const int64_t tx_slot = slot + 1;
+    if (s_auto_last_queued_slot == tx_slot) return changed;
+    if (s_auto_attempts >= 5) {
+        qso_auto_off("FT4 AUTO STOP - NO REPLY AFTER 5 TX");
+        return true;
+    }
+    char to[16], from[16], extra[16];
+    if (sscanf(s_qso_preview, "%15s %15s %15s", to, from, extra) != 3) {
+        qso_auto_off("FT4 AUTO - INVALID MESSAGE"); return true;
+    }
+    esp_err_t err = qso_sync_tx_frequency();
+    if (err == ESP_OK) err = si5351_ft4_set_message(to, from, extra);
+    if (err == ESP_OK) err = si5351_ft4_start_parity(s_auto_tx_parity);
+    if (err != ESP_OK) {
+        s_qso_error = true;
+        qso_auto_off("FT4 AUTO - TX ERROR");
+        return true;
+    }
+    qso_history_queue_tx();
+    if (s_qso_step == 4) {
+        s_auto_final_queued = true;
+        s_auto_final_started = false;
+    }
+    if (!s_qso_start_utc) s_qso_start_utc = (time_t)(tx_slot * 7500000LL / 1000000LL);
+    if (s_qso_step == 2) snprintf(s_qso_rst_sent, sizeof s_qso_rst_sent, "%.7s", extra + 1);
+    else if (s_qso_step == 1) snprintf(s_qso_rst_sent, sizeof s_qso_rst_sent, "%.7s", extra);
+    s_auto_last_queued_slot = tx_slot;
+    s_auto_attempts++;
+    snprintf(s_auto_status, sizeof s_auto_status, "FT4 AUTO %s %d/5", s_qso_steps[s_qso_step], s_auto_attempts);
+    return true;
+}
+
 static bool qso_auto_tick(void)
 {
     if (!s_auto || !s_qso_has_selected || s_auto_done || s_mode != DSP_MODE_FT8) return false;
@@ -1545,6 +1676,101 @@ static bool qso_auto_tick(void)
 
 /* CQ calls use the existing FT8 encoder and TX worker. The first fresh,
  * directed reply from the opposite RX slot starts an automatic QSO. */
+/* FT4 AUTO CQ: receive on one 7.5 s parity, transmit on the other.
+ * Never start late: the same pre-slot scheduling window as ft4_auto_tick(). */
+static bool ft4_cq_tick(void)
+{
+    if (!s_cq_active || s_mode != DSP_MODE_FT4) return false;
+    ft8_msg_t msgs[24];
+    ft8_status_t st;
+    int n = ft4_get_messages(msgs, 24, &st);
+    for (int i = 0; i < n; ++i) {
+        const ft8_msg_t *m = &msgs[i];
+        if (m->seq <= s_cq_last_rx_seq) continue;
+        s_cq_last_rx_seq = m->seq;
+        char to[20] = "", from[20] = "", extra[20] = "";
+        if (sscanf(m->text, "%19s %19s %19s", to, from, extra) != 3) continue;
+        if (strcmp(to, station_call()) || !strcmp(from, station_call()) ||
+            !strcmp(from, "CQ") || s_cq_last_queued_slot < 0) continue;
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        if (tv.tv_sec < 1760000000LL || !m->utc_slot) continue;
+        int64_t now_slot = ((int64_t)tv.tv_sec * 1000000LL + tv.tv_usec) / 7500000LL;
+        if (now_slot < (int64_t)m->utc_slot || now_slot - (int64_t)m->utc_slot > 2 ||
+            ((int64_t)m->utc_slot & 1LL) == s_cq_tx_parity) continue;
+        char call[sizeof s_qso_call];
+        if (!qso_extract_call(m->text, call, sizeof call) || strcmp(call, from)) continue;
+        /* A CQ frame might already be queued. Cancel it before handing
+         * scheduling over to FT4 AUTO SEQ; never transmit both frames. */
+        if (si5351_tone_test_running()) si5351_tone_test_stop();
+        s_cq_active = false;
+        s_qso_own_cq = true;
+        s_qso_selected = *m;
+        snprintf(s_qso_call, sizeof s_qso_call, "%s", call);
+        s_qso_has_selected = true;
+        s_qso_wait_cq = false;
+        s_qso_history_n = 0;
+        s_qso_history_last_seq = m->seq;
+        s_qso_tx_pending = false;
+        s_qso_tx_seen = false;
+        s_qso_tx_step = -1;
+        qso_history_add(m->text, false, m->snr);
+        s_qso_step = qso_is_report(extra) ? 2 : 1; /* grid -> REPORT, report -> R-RPT */
+        s_qso_error = false;
+        s_auto = true;
+        s_auto_enabled = true;
+        s_auto_done = false;
+        s_auto_logged = false;
+        s_auto_final_queued = false;
+        s_auto_final_started = false;
+        s_auto_attempts = 0;
+        s_auto_tx_parity = s_cq_tx_parity;
+        s_auto_last_queued_slot = -1;
+        s_auto_last_seq = m->seq;
+        s_qso_rst_sent[0] = s_qso_rst_rcvd[0] = 0;
+        if (qso_is_report(extra))
+            snprintf(s_qso_rst_rcvd, sizeof s_qso_rst_rcvd, "%.7s",
+                     extra[0] == 'R' ? extra + 1 : extra);
+        s_qso_start_utc = 0;
+        ft4_set_qso_focus(s_qso_call, (int)m->freq);
+        qso_prepare();
+        snprintf(s_auto_status, sizeof s_auto_status,
+                 "FT4 CQ ANSWER %.15s - AUTO REPORT", s_qso_call);
+        return true;
+    }
+    if (si5351_tone_test_running() || si5351_relay_is_tx()) return false;
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    if (tv.tv_sec < 1760000000LL) return false;
+    int64_t utc_us = (int64_t)tv.tv_sec * 1000000LL + tv.tv_usec;
+    int64_t slot = utc_us / 7500000LL;
+    int64_t elapsed = utc_us % 7500000LL;
+    if (((slot + 1) & 1LL) != s_cq_tx_parity ||
+        elapsed < 6200000LL || elapsed > 7000000LL) return false;
+    int64_t tx_slot = slot + 1;
+    if (s_cq_last_queued_slot == tx_slot) return false;
+    esp_err_t err = si5351_ft8_set_base_cHz(
+        ((uint64_t)s_center + s_cq_tx_audio_hz) * 100ULL);
+    if (err == ESP_OK) err = si5351_ft4_set_message("CQ", station_call(), station_grid());
+    if (err == ESP_OK) err = si5351_ft4_start_parity(s_cq_tx_parity);
+    if (err != ESP_OK) {
+        s_cq_active = false;
+        s_qso_error = true;
+        snprintf(s_auto_status, sizeof s_auto_status,
+                 "FT4 CQ TX ERROR: %s", esp_err_to_name(err));
+        return true;
+    }
+    s_cq_last_queued_slot = tx_slot;
+    s_qso_tx_step = -1;
+    snprintf(s_qso_tx_message, sizeof s_qso_tx_message,
+             "CQ %s %s", station_call(), station_grid());
+    s_qso_tx_pending = true;
+    s_qso_tx_seen = false;
+    snprintf(s_auto_status, sizeof s_auto_status,
+             "FT4 CQ TX QUEUED - %lu HZ", (unsigned long)s_cq_tx_audio_hz);
+    return true;
+}
+
 static bool cq_tick(void)
 {
     if (!s_cq_active || s_mode != DSP_MODE_FT8) return false;
@@ -1692,7 +1918,7 @@ static bool cq_tick(void)
 static void qso_draw(void)
 {
     rect(0, 0, LW, LH, RGB565(10,14,30));
-    text(12, 8, 2, COL_ACCENT, "FT8 QSO");
+    text(12, 8, 2, COL_ACCENT, s_mode == DSP_MODE_FT4 ? "FT4 QSO" : "FT8 QSO");
     /* Compact TX monitor volume control in header, left of LOG. */
     char mon_label[24];
     text(237, 9, 1, COL_TEXT, "TX MON");
@@ -1771,10 +1997,12 @@ static void qso_draw(void)
 }
 static bool qso_touch(int x, int y)
 {
+    /* Shared FT8/FT4 QSO controls: handle BEFORE the FT4-specific branch.
+     * Otherwise FT4 consumes touches and displays the misleading pending status. */
     if (x >= 530 && x < 628 && y >= 57 && y < 80) {
-        /* Do not change an active or queued transmission. */
         if (si5351_tone_test_running() || si5351_relay_is_tx()) {
-            snprintf(s_auto_status, sizeof s_auto_status, "WAIT UNTIL TX FINISHES TO CHANGE CQ FREQ");
+            snprintf(s_auto_status, sizeof s_auto_status,
+                     "WAIT UNTIL TX FINISHES TO CHANGE CQ FREQ");
             return true;
         }
         uint32_t next = s_cq_tx_audio_hz;
@@ -1786,15 +2014,14 @@ static bool qso_touch(int x, int y)
         if (next != s_cq_tx_audio_hz) {
             s_cq_tx_audio_hz = next;
             cq_tx_audio_save();
-            /* When idle, update the displayed RF TX base for our own CQ. */
             if (!s_qso_has_selected || s_qso_own_cq) {
                 esp_err_t err = si5351_ft8_set_base_cHz(
                     ((uint64_t)s_center + s_cq_tx_audio_hz) * 100ULL);
                 if (err == ESP_OK)
                     s_qso_rf_base_chz = ((uint64_t)s_center + s_cq_tx_audio_hz) * 100ULL;
             }
-            snprintf(s_auto_status, sizeof s_auto_status, "CQ TX AUDIO: %lu HZ (SAVED)",
-                     (unsigned long)s_cq_tx_audio_hz);
+            snprintf(s_auto_status, sizeof s_auto_status,
+                     "CQ TX AUDIO: %lu HZ (SAVED)", (unsigned long)s_cq_tx_audio_hz);
         }
         return true;
     }
@@ -1807,6 +2034,131 @@ static bool qso_touch(int x, int y)
         s_ft8_log_page = 0; s_ft8_log_selected = -1;
         s_ft8_log_confirm = false; s_ft8_log_notice[0] = 0;
         ft8_log_refresh(); s_menu = 13; return true;
+    }
+    if (s_mode == DSP_MODE_FT4) {
+        /* Phase 4: FT4 one-shot manual SEND/CQ only. Never arm FT8 AUTO SEQ. */
+        if (y >= 218 && y < 248 && x >= 12 && x < 637 &&
+            s_qso_has_selected && !si5351_tone_test_running()) {
+            int idx = (x - 12) / 125;
+            if (idx >= 0 && idx < 5 && (x - 12) % 125 < 117) {
+                s_qso_step = idx;
+                qso_prepare();
+            }
+            return true;
+        }
+        if (y >= 256 && y < 283 && x >= 12 && x < 172 && s_qso_has_selected) {
+            if (s_qso_wait_cq || s_auto_tx_parity < 0) {
+                snprintf(s_auto_status, sizeof s_auto_status, "FT4 AUTO - SELECT FRESH CQ");
+            } else if (!si5351_tone_test_running()) {
+                s_auto_enabled = true;
+                s_auto = true;
+                s_auto_done = false;
+                s_auto_final_queued = false;
+                s_auto_final_started = false;
+                s_auto_attempts = 0;
+                s_auto_last_seq = s_qso_selected.seq;
+                s_auto_last_queued_slot = -1;
+                snprintf(s_auto_status, sizeof s_auto_status, "FT4 AUTO SEQ ARMED");
+            }
+            return true;
+        }
+        if (y >= 256 && y < 283 && x >= 480 && x < 628) {
+            s_auto_cq = !s_auto_cq;
+            snprintf(s_auto_status, sizeof s_auto_status,
+                     "FT4 AUTO QSO %s", s_auto_cq ? "ENABLED" : "DISABLED");
+            return true;
+        }
+        if (y >= 299 && y < 350 && x >= 480 && x < 628) {
+            s_menu = 0;
+            s_panel_mode = -1;
+            return true;
+        }
+        if (y >= 299 && y < 350 && x >= 168 && x < 310) {
+            si5351_tone_test_stop();
+            s_cq_active = false;
+            s_auto = false;
+            s_auto_enabled = false; /* explicit STOP disables auto until re-armed */
+            s_auto_cq = false;
+            s_qso_has_selected = false;
+            s_qso_call[0] = 0;
+            ft4_set_qso_focus(NULL, 0);
+            snprintf(s_auto_status, sizeof s_auto_status, "FT4 STOPPED");
+            return true;
+        }
+        if (y >= 299 && y < 350 && x >= 12 && x < 154) {
+            if (!s_qso_has_selected || s_qso_wait_cq || !s_qso_selected.utc_slot) {
+                snprintf(s_auto_status, sizeof s_auto_status, "FT4: SELECT FRESH CQ FIRST");
+                return true;
+            }
+            if (si5351_tone_test_running() || si5351_relay_is_tx()) {
+                snprintf(s_auto_status, sizeof s_auto_status, "FT4 TX BUSY");
+                return true;
+            }
+            struct timeval now;
+            gettimeofday(&now, NULL);
+            int64_t utc_us = (int64_t)now.tv_sec * 1000000LL + now.tv_usec;
+            int64_t current_slot = utc_us / 7500000LL;
+            int64_t age = current_slot - (int64_t)s_qso_selected.utc_slot;
+            if (now.tv_sec < 1760000000LL || age < 0 || age > 4) {
+                snprintf(s_auto_status, sizeof s_auto_status, "FT4 CQ TOO OLD - SELECT NEW CQ");
+                return true;
+            }
+            char to[16], from[16], extra[16];
+            if (sscanf(s_qso_preview, "%15s %15s %15s", to, from, extra) != 3) {
+                snprintf(s_auto_status, sizeof s_auto_status, "FT4 INVALID MESSAGE");
+                return true;
+            }
+            esp_err_t err = qso_sync_tx_frequency();
+            if (err == ESP_OK) err = si5351_ft4_set_message(to, from, extra);
+            if (err == ESP_OK) err = si5351_ft4_start_parity((int)((s_qso_selected.utc_slot + 1u) & 1u));
+            s_qso_error = (err != ESP_OK);
+            if (err == ESP_OK) {
+                qso_history_queue_tx();
+                snprintf(s_auto_status, sizeof s_auto_status, "FT4 SEND QUEUED - ONE FRAME");
+            } else {
+                snprintf(s_auto_status, sizeof s_auto_status, "FT4 SEND: %s", esp_err_to_name(err));
+            }
+            return true;
+        }
+        if (y >= 299 && y < 350 && x >= 324 && x < 466) {
+            if (si5351_tone_test_running() || si5351_relay_is_tx()) {
+                snprintf(s_auto_status, sizeof s_auto_status, "FT4 TX BUSY - PRESS STOP");
+                return true;
+            }
+            esp_err_t err = si5351_ft8_set_base_cHz(((uint64_t)s_center + s_cq_tx_audio_hz) * 100ULL);
+            if (err == ESP_OK) err = si5351_ft4_set_message("CQ", station_call(), station_grid());
+            if (err == ESP_OK) err = si5351_ft4_start_parity(s_auto_cq ? 0 : -1);
+            s_qso_error = (err != ESP_OK);
+            if (err == ESP_OK) {
+                /* Manual CQ becomes repeated AUTO CQ only when AUTO QSO is ON. */
+                if (s_auto_cq) {
+                    s_cq_active = true;
+                    s_qso_has_selected = false;
+                    s_qso_call[0] = 0;
+                    s_qso_own_cq = false;
+                    s_qso_step = 1;
+                    s_qso_history_n = 0;
+                    s_qso_history_last_seq = 0;
+                    s_auto = false;
+                    s_cq_tx_parity = 0;
+                    /* First manually queued CQ uses next available slot.
+                     * Do not queue another CQ until it has completed. */
+                    s_cq_last_queued_slot = -1;
+                    ft8_msg_t cq_msgs[24];
+                    ft8_status_t cq_st;
+                    int cq_n = ft4_get_messages(cq_msgs, 24, &cq_st);
+                    s_cq_last_rx_seq = cq_n ? cq_msgs[cq_n - 1].seq : 0;
+                    ft4_set_qso_focus(NULL, 0);
+                }
+                snprintf(s_auto_status, sizeof s_auto_status,
+                         s_auto_cq ? "FT4 AUTO CQ ARMED" : "FT4 CQ QUEUED - ONE FRAME");
+            }
+            else
+                snprintf(s_auto_status, sizeof s_auto_status, "FT4 CQ ERROR: %s", esp_err_to_name(err));
+            return true;
+        }
+        /* Unassigned FT4 QSO touch: preserve the current status message. */
+        return false;
     }
     if (y >= 218 && y < 248 && x >= 12 && x < 637 && !s_auto && !s_cq_active && s_qso_has_selected) {
         int idx = (x - 12) / 125;
@@ -1980,6 +2332,56 @@ static void ft8_draw_back_button(void)
          s_auto ? COL_ACCENT : COL_BTN_HI);
     text(FT8_BACK_X + 5, FT8_BACK_Y + 15, 2,
          s_auto ? COL_BG : COL_TEXT, "QSO");
+}
+
+/* FT4 RX panel with shared QSO tracking and automatic sequencing. */
+static void draw_ft4_panel(void)
+{
+    ft8_msg_t msgs[PANEL_COLS * PANEL_ROWS];
+    ft8_status_t st = {0};
+    int n = ft8_visible_messages(msgs, PANEL_COLS * PANEL_ROWS, &st);
+    bool body = panel_begin(DSP_MODE_FT4, s_ft8_visible_period_revision);
+    char b[100];
+    if (st.locked)
+        snprintf(b, sizeof b, "FT4 RX  SLOT SYNC OK  T %.1f S  MSGS %u", (double)st.slot_pos, (unsigned)st.total);
+    else
+        snprintf(b, sizeof b, "FT4 RX  SCANNING  MSGS %u", (unsigned)st.total);
+    text(6, WF_Y0 + 3, 1, st.locked ? COL_ACCENT : COL_LINE, b);
+    if (!body) { ft8_draw_filter_button(); ft8_draw_back_button(); return; }
+    if (!n) {
+        text(6, WF_Y0 + PANEL_HDR_H + 4, 1, COL_TEXT, "FT4: TAP A DECODED STATION TO MONITOR QSO");
+        ft8_draw_filter_button();
+        ft8_draw_back_button();
+        return;
+    }
+    /* FT4 uses the same ADIF worked-before lookup and CQ colours as FT8. */
+    ft8_b4_ensure_loaded();
+    uint8_t band = ft8_b4_band((double)s_center / 1000000.0);
+    panel_separators();
+    for (int k = 0; k < n; ++k) {
+        const ft8_msg_t *msg = &msgs[n - 1 - k];
+        snprintf(b, sizeof b, "%4d %+3d %.*s", (int)msg->freq, (int)msg->snr, PANEL_TEXT_CH, msg->text);
+        uint16_t color = COL_TEXT;
+        if (ft8_is_cq_message(msg->text)) {
+            char cq_call[FT8_B4_CALL_LEN] = "";
+            char a[20] = "", bcall[20] = "", ccall[20] = "";
+            int parts = sscanf(msg->text, "%19s %19s %19s", a, bcall, ccall);
+            const char *candidate = (parts >= 3 && (!strcmp(bcall, "DX") ||
+                !strcmp(bcall, "TEST"))) ? ccall : (parts >= 2 ? bcall : "");
+            if (*candidate && strlen(candidate) < sizeof cq_call &&
+                strpbrk(candidate, "0123456789") &&
+                strpbrk(candidate, "ABCDEFGHIJKLMNOPQRSTUVWXYZ"))
+                snprintf(cq_call, sizeof cq_call, "%s", candidate);
+            if (cq_call[0] && s_ft8_b4_loaded && band)
+                color = ft8_b4_find(cq_call, band) ?
+                    RGB565(255, 145, 145) : RGB565(70, 255, 110);
+            else
+                color = RGB565(255, 220, 0);
+        }
+        panel_line(k, n, color, b);
+    }
+    ft8_draw_filter_button();
+    ft8_draw_back_button();
 }
 
 static void draw_ft8_panel(void)
@@ -2165,6 +2567,7 @@ static void draw_spectrum(const float *spec, int bins)
     for (int y = SPEC_Y0; y < (rs ? SPEC_Y0 + SPEC_H : WF_Y0 + WF_H); y++) LBUF[(size_t)y * LW + cx] = COL_LINE;
     if (s_mode == DSP_MODE_RS41) draw_rs41_panel();
     else if (s_mode == DSP_MODE_FT8) draw_ft8_panel();
+    else if (s_mode == DSP_MODE_FT4) draw_ft4_panel();
     else if (s_mode == DSP_MODE_WSPR) draw_wspr_panel();
     if (lora_aprs_enabled() || s_mode == DSP_MODE_HORUS) {
         char msg[192];
@@ -2249,9 +2652,9 @@ static const box_t B_LORA = {339, 272, 54, 44};
 static const box_t B_APRS = {396, 272, 52, 44};
 /* Mode row: WFM NFM AM USB LSB CW FT8 WSPR — 8 buttons, 52 px wide, 3 px gap (RS41 has its own
  * button). The row ends at x = 443; VOL/SQL start at x = 454. */
-static const uint8_t MODE_ROW[] = {DSP_MODE_WFM, DSP_MODE_NFM, DSP_MODE_AM, DSP_MODE_USB, DSP_MODE_LSB, DSP_MODE_CW, DSP_MODE_FT8, DSP_MODE_WSPR};
+static const uint8_t MODE_ROW[] = {DSP_MODE_WFM, DSP_MODE_NFM, DSP_MODE_AM, DSP_MODE_USB, DSP_MODE_LSB, DSP_MODE_CW, DSP_MODE_FT8, DSP_MODE_FT4, DSP_MODE_WSPR};
 #define N_MODE_ROW (int)(sizeof(MODE_ROW) / sizeof(MODE_ROW[0]))
-#define MODE_BTN_W 52
+#define MODE_BTN_W 46
 #define MODE_BTN_X(i) (6 + (i) * (MODE_BTN_W + 3))
 #define MODE_BTN_Y 322
 #define MODE_BTN_H 36
@@ -2392,6 +2795,12 @@ static void set_step_hz(uint32_t hz)
  * the cursors below are just the manual-preset positions. */
 static int s_ft8_i = 3; /* 20 m */
 static int s_wspr_i = 5; /* 20 m */
+/* FT4 USB dial frequencies. Repeated FT4 button presses cycle this list. */
+static const uint32_t s_ft4_freqs[] = {
+    3575000u, 7047500u, 10140000u, 14080000u, 18104000u,
+    21140000u, 24919000u, 28180000u, 50318000u
+};
+static int s_ft4_i = 3; /* 20 m */
 
 /* Digital-mode button: narrow 96 kHz view, 100 Hz step; pressed again = next frequency of the
  * list, otherwise keep the dial if it is already on one of the frequencies, else jump to the
@@ -2590,6 +2999,15 @@ static void mode_button(int m)
         const uint32_t *f = bandplan_ft8_freqs(&n);
         digital_preset(f, n, &s_ft8_i, again);
         s_label = "FT8";
+    } else if (m == DSP_MODE_FT4) {
+        s_qso_has_selected = false;
+        s_cq_active = false;
+        s_auto = false;
+        ft4_set_qso_focus(NULL, 0);
+        digital_preset(s_ft4_freqs,
+                       (int)(sizeof(s_ft4_freqs) / sizeof(s_ft4_freqs[0])),
+                       &s_ft4_i, again);
+        s_label = "FT4";
     } else if (m == DSP_MODE_WSPR) {
         int n;
         const uint32_t *f = bandplan_wspr_freqs(&n);
@@ -3581,7 +3999,7 @@ static bool handle_touch(void)
      * A touch in the list is never interpreted as a frequency gesture. */
     bool quick_ft8_row_touch = false;
     if (n == 1 && s_menu == 0 && !s_scr_off &&
-        s_mode == DSP_MODE_FT8 && !lora_aprs_enabled()) {
+        (s_mode == DSP_MODE_FT8 || s_mode == DSP_MODE_FT4) && !lora_aprs_enabled()) {
         int ty = p[0].x / SCALE;
         int tx = (PANEL_H - p[0].y) / SCALE;
         quick_ft8_row_touch = (ty >= WF_Y0 + 3 + PANEL_HDR_H &&
@@ -3616,7 +4034,7 @@ static bool handle_touch(void)
     if (edge && s_touch_beep && (s_menu || ly >= CTRL_Y0 ||
         (ly < SPEC_Y0 && lx >= 180 && lx < 470) ||
         (s_mode == DSP_MODE_RS41 && lx >= 540 && ly >= WF_Y0 + 3 && ly < WF_Y0 + 29) ||
-        (s_mode == DSP_MODE_FT8 && !lora_aprs_enabled() &&
+        ((s_mode == DSP_MODE_FT8 || s_mode == DSP_MODE_FT4) && !lora_aprs_enabled() &&
          ((lx >= FT8_BACK_X && lx < FT8_BACK_X + FT8_BACK_W &&
            ly >= FT8_BACK_Y && ly < FT8_BACK_Y + FT8_BACK_H) ||
           (lx >= FT8_FILTER_X && lx < FT8_FILTER_X + FT8_FILTER_W &&
@@ -3733,7 +4151,7 @@ static bool handle_touch(void)
     }
 
     /* FT8 ALL/CQ display filter. Does not affect decoder or AUTO SEQ. */
-    if (edge && s_mode == DSP_MODE_FT8 && !lora_aprs_enabled() &&
+    if (edge && (s_mode == DSP_MODE_FT8 || s_mode == DSP_MODE_FT4) && !lora_aprs_enabled() &&
         lx >= FT8_FILTER_X && lx < FT8_FILTER_X + FT8_FILTER_W &&
         ly >= FT8_FILTER_Y && ly < FT8_FILTER_Y + FT8_FILTER_H) {
         s_ft8_cq_only = !s_ft8_cq_only;
@@ -3743,7 +4161,7 @@ static bool handle_touch(void)
     }
 
     /* Reopen the active QSO without resetting its state or TX parity. */
-    if (edge && s_mode == DSP_MODE_FT8 &&
+    if (edge && (s_mode == DSP_MODE_FT8 || s_mode == DSP_MODE_FT4) &&
         !lora_aprs_enabled() && lx >= FT8_BACK_X && lx < FT8_BACK_X + FT8_BACK_W &&
         ly >= FT8_BACK_Y && ly < FT8_BACK_Y + FT8_BACK_H) {
         s_menu = 12;
@@ -3753,7 +4171,7 @@ static bool handle_touch(void)
     }
 
     /* FT8 decoded text: select any station, including an ongoing QSO. */
-    if (edge && s_mode == DSP_MODE_FT8 && !lora_aprs_enabled() &&
+    if (edge && (s_mode == DSP_MODE_FT8 || s_mode == DSP_MODE_FT4) && !lora_aprs_enabled() &&
         ly >= WF_Y0 + 3 + PANEL_HDR_H && ly < WF_Y0 + 3 + PANEL_HDR_H + PANEL_ROWS * 10) {
         if (qso_select_panel_row(lx, ly)) {
             s_menu = 12;
@@ -3778,14 +4196,14 @@ static bool handle_touch(void)
     /* In FT8, decoded-message rows are never a tuning gesture. Allow
      * drag/tap tuning only in the upper spectrum area (above WF_Y0).
      * This also prevents an imprecise touch from retuning the receiver. */
-    if (s_mode == DSP_MODE_FT8 && pressed && ly >= WF_Y0 && ly < CTRL_Y0) {
+    if ((s_mode == DSP_MODE_FT8 || s_mode == DSP_MODE_FT4) && pressed && ly >= WF_Y0 && ly < CTRL_Y0) {
         dragging = false;
         tap_moved = true;
         prev = pressed;
         return changed;
     }
     if (pressed && ly < CTRL_Y0 && !lora_aprs_enabled() &&
-        (s_mode != DSP_MODE_FT8 || ly < WF_Y0)) {
+        ((s_mode != DSP_MODE_FT8 && s_mode != DSP_MODE_FT4) || ly < WF_Y0)) {
         /* drag the spectrum/waterfall to scan */
         if (edge) { dragging = true; drag_x0 = lx; drag_f0 = s_center; tap_moved = false; tap_y = ly; }
         else if (dragging) {
@@ -3954,12 +4372,54 @@ static void ui_task(void *arg)
     rect(0, 0, LW, LH, COL_BG);
     rect(0, WF_Y0, LW, WF_H, RGB565(0, 0, 0));
 
-    /* welcome splash: title + callsign centred on the whole display */
-    rect(0, 0, LW, LH, COL_PANEL);
-    text((LW - text_w(SPLASH_TITLE, 6)) / 2, 126, 6, COL_ACCENT, SPLASH_TITLE);
-    text((LW - text_w(station_call(), 4)) / 2, 180, 4, COL_LINE, station_call());
-    present();
-    vTaskDelay(pdMS_TO_TICKS(SPLASH_MS));
+    /* Animated startup splash: 2.5 seconds, no external fonts/assets. */
+    const char *welcome_call = station_call();
+    const int title_sc = 7, call_sc = 5;
+    const int title_x = (LW - text_w(SPLASH_TITLE, title_sc)) / 2;
+    const int call_x = (LW - text_w(welcome_call, call_sc)) / 2;
+    for (int frame = 0; frame < 25; ++frame) {
+        /* Dark navy background with subtle horizontal highlights. */
+        rect(0, 0, LW, LH, RGB565(5, 10, 25));
+        for (int y = 0; y < LH; y += 8) {
+            int glow = 10 + (LH / 2 - (y > LH / 2 ? y - LH / 2 : LH / 2 - y)) / 24;
+            rect(0, y, LW, 1, RGB565(5, glow, 30 + glow));
+        }
+        /* Decorative corner brackets and radio-style horizontal rules. */
+        const uint16_t edge = RGB565(23, 95, 124);
+        rect(38, 38, 92, 2, edge); rect(38, 38, 2, 36, edge);
+        rect(LW - 130, 38, 92, 2, edge); rect(LW - 40, 38, 2, 36, edge);
+        rect(38, LH - 40, 92, 2, edge); rect(38, LH - 74, 2, 36, edge);
+        rect(LW - 130, LH - 40, 92, 2, edge); rect(LW - 40, LH - 74, 2, 36, edge);
+
+        /* A small moving RF sweep above the title. */
+        const int sweep_w = (LW - 180) * (frame + 1) / 25;
+        rect(90, 98, LW - 180, 2, RGB565(25, 44, 67));
+        rect(90, 98, sweep_w, 2, RGB565(0, 180, 185));
+        if (sweep_w > 4) rect(90 + sweep_w - 4, 94, 4, 10, RGB565(130, 245, 235));
+
+        /* Reveal title character-by-character with a restrained shadow. */
+        char title_reveal[sizeof(SPLASH_TITLE)] = {0};
+        int visible = frame < 4 ? frame + 1 : (int)sizeof(SPLASH_TITLE) - 1;
+        if (visible > (int)sizeof(SPLASH_TITLE) - 1) visible = (int)sizeof(SPLASH_TITLE) - 1;
+        memcpy(title_reveal, SPLASH_TITLE, (size_t)visible);
+        text(title_x + 3, 141 + 3, title_sc, RGB565(9, 47, 61), title_reveal);
+        text(title_x, 141, title_sc, RGB565(85, 238, 219), title_reveal);
+
+        /* Station identity fades in after the title. */
+        if (frame >= 6) {
+            const int level = (frame - 5) * 24 > 255 ? 255 : (frame - 5) * 24;
+            text(call_x + 2, 226 + 2, call_sc, RGB565(40, 35, 13), welcome_call);
+            text(call_x, 226, call_sc,
+                 RGB565((255 * level) / 255, (195 * level) / 255, (72 * level) / 255),
+                 welcome_call);
+        }
+        /* Animated progress indicator, independent of SDR/USB startup. */
+        rect(150, LH - 95, LW - 300, 5, RGB565(27, 43, 61));
+        rect(150, LH - 95, (LW - 300) * (frame + 1) / 25, 5,
+             RGB565(0, 187, 152));
+        present();
+        vTaskDelay(pdMS_TO_TICKS(SPLASH_MS / 25));
+    }
 
     cpu_temp_init();
     cpu_temp_sample();
@@ -3993,7 +4453,9 @@ static void ui_task(void *arg)
         previous_menu = s_menu;
         /* Process directed CQ replies before scheduling AUTO TX. */
         if (cq_tick()) dirty = true;
+        if (ft4_cq_tick()) dirty = true;
         if (qso_auto_tick()) dirty = true;
+        if (ft4_auto_tick()) dirty = true;
         if (qso_history_rx_tick()) dirty = true;
         if (rs_scan_tick()) dirty = true;
         /* Do not let an active FT8/WSPR schedule override manual HORUS reception. */

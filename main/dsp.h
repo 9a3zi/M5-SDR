@@ -29,6 +29,7 @@ enum {
     DSP_MODE_WSPR = 8, /* WSPR beacon mode: USB audio → wspr.c                  */
     DSP_MODE_HORUS = 9, /* RTL-SDR 4FSK front-end; packet decoding pending */
     DSP_MODE_APRS = 10, /* 1200-baud Bell 202 AX.25 via RTL-SDR */
+    DSP_MODE_FT4 = 11, /* FT4 digital reception */
     DSP_MODE_COUNT
 };
 

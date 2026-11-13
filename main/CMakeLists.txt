@@ -1,6 +1,6 @@
 idf_component_register(
     SRCS
-        "main.c" "sdr.c" "dsp.c" "aprs.c" "audio.c" "ui.c" "rs41.c" "rs41_log.c" "ft8.c" "wspr.c"
+        "main.c" "sdr.c" "dsp.c" "aprs.c" "audio.c" "ui.c" "rs41.c" "rs41_log.c" "ft8.c" "ft4.c" "wspr.c"
         "wifi_net.c" "web_mirror.c" "station_settings.c" "psk.c" "bandplan.c" "lora_aprs.c" "horus.c" "horus_decoder.c"
         "horus_v3.c" "si5351.c"
         "horuslib/fsk.c" "horuslib/kiss_fft.c" "horuslib/kiss_fftr.c"
@@ -70,7 +70,7 @@ set_source_files_properties(
 )
 
 # Digital decoders.
-set_source_files_properties("ft8.c" "wspr.c" PROPERTIES COMPILE_FLAGS "-O2")
+set_source_files_properties("ft8.c" "ft4.c" "wspr.c" PROPERTIES COMPILE_FLAGS "-O2")
 
 # HORUS V1/V2 library.
 set_source_files_properties(

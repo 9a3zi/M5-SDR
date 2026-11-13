@@ -146,9 +146,11 @@ static char s_tx_extra[16] = "JN86";
 static char s_tx_label[64] = "CQ 9A3ZI JN86";
 /* Replace CQ symbols at a symbol boundary without dropping the TX relay. */
 static volatile bool s_tone_running;
+/* TX protocol is latched before the worker starts; FT8 remains default. */
+static volatile bool s_tx_ft4;
 static volatile bool s_tone_stop;
 static portMUX_TYPE s_swap_mux = portMUX_INITIALIZER_UNLOCKED;
-static uint8_t s_swap_tones[FT8_NN];
+static uint8_t s_swap_tones[FT4_NN > FT8_NN ? FT4_NN : FT8_NN];
 static volatile bool s_swap_pending;
 
 esp_err_t si5351_ft8_replace_active_message(const char *to, const char *from, const char *extra)
@@ -159,8 +161,9 @@ esp_err_t si5351_ft8_replace_active_message(const char *to, const char *from, co
     ftx_message_init(&msg);
     if (ftx_message_encode_std(&msg, NULL, to, from, extra) != FTX_MESSAGE_RC_OK)
         return ESP_ERR_INVALID_ARG;
-    uint8_t new_tones[FT8_NN];
-    ft8_encode(msg.payload, new_tones);
+    uint8_t new_tones[FT4_NN > FT8_NN ? FT4_NN : FT8_NN];
+    if (s_tx_ft4) ft4_encode(msg.payload, new_tones);
+    else ft8_encode(msg.payload, new_tones);
     portENTER_CRITICAL(&s_swap_mux);
     memcpy(s_swap_tones, new_tones, sizeof(new_tones));
     s_swap_pending = true;
@@ -339,7 +342,8 @@ static bool s_sntp_attempted = false;
 
 static bool wait_for_ft8_slot(int64_t *start_us)
 {
-    ESP_LOGI(TAG, "WAIT: UTC clock and next 15-second slot");
+    const int64_t slot_len = s_tx_ft4 ? 7500000LL : 15000000LL;
+    ESP_LOGI(TAG, "WAIT: UTC clock and next %s slot", s_tx_ft4 ? "7.5-second FT4" : "15-second FT8");
     const int64_t deadline = esp_timer_get_time() + 60000000LL;
     int64_t last_log = 0;
 
@@ -367,18 +371,18 @@ static bool wait_for_ft8_slot(int64_t *start_us)
 
         if (s_utc_offset_valid) {
             const int64_t utc_us = mono + s_utc_minus_mono_us;
-            int64_t current_slot = (utc_us / 15000000LL) * 15000000LL;
+            int64_t current_slot = (utc_us / slot_len) * slot_len;
             int64_t elapsed = utc_us - current_slot;
-            bool fast = s_requested_tx_parity >= 0 &&
-                        ((current_slot / 15000000LL) & 1LL) == s_requested_tx_parity &&
+            bool fast = !s_tx_ft4 && s_requested_tx_parity >= 0 &&
+                        ((current_slot / slot_len) & 1LL) == s_requested_tx_parity &&
                         elapsed <= FT8_FAST_LATE_MAX_US - FT8_FAST_PREP_US;
             int64_t next_slot = fast ? current_slot :
-                                current_slot + 15000000LL;
+                                current_slot + slot_len;
             if (!fast && next_slot - utc_us < 500000LL)
-                next_slot += 15000000LL;
+                next_slot += slot_len;
             if (s_requested_tx_parity >= 0 &&
-                ((next_slot / 15000000LL) & 1LL) != s_requested_tx_parity)
-                next_slot += 15000000LL;
+                ((next_slot / slot_len) & 1LL) != s_requested_tx_parity)
+                next_slot += slot_len;
             /* Use the SAME UTC reference for regular and fast QSO TX.
              * Fast TX still uses the current parity-matched slot. If queued
              * after the calibrated boundary, start as soon as preparation
@@ -419,8 +423,9 @@ esp_err_t si5351_ft8_takeover_queued_send(const char *to, const char *from, cons
     ftx_message_init(&msg);
     if (ftx_message_encode_std(&msg, NULL, to, from, extra) != FTX_MESSAGE_RC_OK)
         return ESP_ERR_INVALID_ARG;
-    uint8_t new_tones[FT8_NN];
-    ft8_encode(msg.payload, new_tones);
+    uint8_t new_tones[FT4_NN > FT8_NN ? FT4_NN : FT8_NN];
+    if (s_tx_ft4) ft4_encode(msg.payload, new_tones);
+    else ft8_encode(msg.payload, new_tones);
     portENTER_CRITICAL(&s_swap_mux);
     memcpy(s_swap_tones, new_tones, sizeof new_tones);
     s_swap_pending = true;
@@ -435,13 +440,18 @@ static void tone_task(void *arg)
     (void)arg;
     ftx_message_t msg;
     ftx_message_init(&msg);
-    uint8_t tones[FT8_NN];
+    const bool ft4 = s_tx_ft4;
+    const int symbol_us = ft4 ? 48000 : 160000;
+    const int symbol_count = ft4 ? FT4_NN : FT8_NN;
+    const int64_t slot_us = ft4 ? 7500000LL : 15000000LL;
+    uint8_t tones[FT4_NN > FT8_NN ? FT4_NN : FT8_NN];
     ftx_message_rc_t rc = ftx_message_encode_std(&msg, NULL, s_tx_to, s_tx_from, s_tx_extra);
     if (rc != FTX_MESSAGE_RC_OK) {
         ESP_LOGE(TAG, "FT8 message encoding failed: %d", (int)rc);
         goto finish;
     }
-    ft8_encode(msg.payload, tones);
+    if (ft4) ft4_encode(msg.payload, tones);
+    else ft8_encode(msg.payload, tones);
 
     if (si5351_clk0_enable(false) != ESP_OK) goto finish;
 restart_schedule:
@@ -462,19 +472,19 @@ restart_schedule:
         }
         int64_t mono = esp_timer_get_time();
         int64_t wall_us = (int64_t)tv.tv_sec * 1000000LL + tv.tv_usec;
-        int64_t slot_us = (wall_us / 15000000LL) * 15000000LL;
+        int64_t slot_start_us = (wall_us / slot_us) * slot_us;
         if (s_requested_tx_parity >= 0 &&
-            ((slot_us / 15000000LL) & 1LL) != s_requested_tx_parity) {
+            ((slot_start_us / slot_us) & 1LL) != s_requested_tx_parity) {
             ESP_LOGW(TAG, "LATE SEND: not our TX parity slot");
             goto finish;
         }
-        start_us = mono + slot_us + FT8_TX_TIME_OFFSET_US - wall_us;
+        start_us = mono + slot_start_us + FT8_TX_TIME_OFFSET_US - wall_us;
         /* Allow I2C setup and antenna relay settling before the first symbol. */
         int64_t ready_us = mono + 100000LL;
         if (ready_us > start_us) {
-            first_symbol = (int)((ready_us - start_us + 159999LL) / 160000LL);
+            first_symbol = (int)((ready_us - start_us + (symbol_us - 1)) / symbol_us);
         }
-        if (first_symbol >= FT8_NN) {
+        if (first_symbol >= symbol_count) {
             ESP_LOGW(TAG, "LATE SEND: FT8 frame already finished");
             goto finish;
         }
@@ -493,7 +503,7 @@ restart_schedule:
     }
     portEXIT_CRITICAL(&s_swap_mux);
     /* Preload the first symbol while CLK0 is muted. */
-    if (si5351_set_frequency_cHz(tx_base_chz + (uint64_t)tones[first_symbol] * 625ULL) != ESP_OK) goto finish;
+    if (si5351_set_frequency_cHz(tx_base_chz + (uint64_t)tones[first_symbol] * (ft4 ? 6250ULL / 3ULL : 625ULL)) != ESP_OK) goto finish;
     /* Stay in RX throughout the waiting period; key only just before TX. */
     if (!s_force_immediate_tx) {
         while (!s_tone_stop && !s_manual_takeover &&
@@ -501,12 +511,13 @@ restart_schedule:
             vTaskDelay(pdMS_TO_TICKS(10));
         if (s_manual_takeover) goto restart_schedule;
     } else {
-        wait_until_us(start_us + (int64_t)first_symbol * 160000LL -
+        wait_until_us(start_us + (int64_t)first_symbol * symbol_us -
                       (int64_t)FT8_RELAY_SETTLE_MS * 1000LL);
     }
     if (s_tone_stop) goto finish;
     if (relay_set_tx(true) != ESP_OK) goto finish;
     /* Mute SDR as soon as the antenna is switched to TX. */
+    audio_ft8_tx_monitor_set_ft4(ft4);
     audio_ft8_tx_monitor_start();
     vTaskDelay(pdMS_TO_TICKS(FT8_RELAY_SETTLE_MS));
     /* Allow limited scheduler/relay latency, but never transmit a badly late frame. */
@@ -516,14 +527,14 @@ restart_schedule:
                  (long long)(relay_lateness_us / 1000LL));
         goto finish;
     }
-    wait_until_us(start_us + (int64_t)first_symbol * 160000LL);
+    wait_until_us(start_us + (int64_t)first_symbol * symbol_us);
     if (s_tone_stop) goto finish;
     s_tone_index = first_symbol;
     if (si5351_clk0_enable(true) != ESP_OK) goto finish;
     audio_ft8_tx_monitor_symbol(tones[first_symbol]);
 
-    for (int n = first_symbol + 1; n < FT8_NN && !s_tone_stop; ++n) {
-        wait_until_us(start_us + (int64_t)n * 160000LL);
+    for (int n = first_symbol + 1; n < symbol_count && !s_tone_stop; ++n) {
+        wait_until_us(start_us + (int64_t)n * symbol_us);
         if (s_tone_stop) break;
         portENTER_CRITICAL(&s_swap_mux);
         if (s_swap_pending) {
@@ -532,14 +543,14 @@ restart_schedule:
         }
         portEXIT_CRITICAL(&s_swap_mux);
         s_tone_index = n;
-        esp_err_t err = si5351_set_frequency_cHz(tx_base_chz + (uint64_t)tones[n] * 625ULL);
+        esp_err_t err = si5351_set_frequency_cHz(tx_base_chz + (uint64_t)tones[n] * (ft4 ? 6250ULL / 3ULL : 625ULL));
         if (err == ESP_OK) audio_ft8_tx_monitor_symbol(tones[n]);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "symbol %d I2C failed: %s", n, esp_err_to_name(err));
             break;
         }
     }
-    if (!s_tone_stop) wait_until_us(start_us + (int64_t)FT8_NN * 160000LL);
+    if (!s_tone_stop) wait_until_us(start_us + (int64_t)symbol_count * symbol_us);
 finish:
     s_tone_index = -1;
     esp_err_t off_err = si5351_clk0_enable(false);
@@ -551,7 +562,7 @@ finish:
             ESP_LOGE(TAG, "Failed to restore RX relay");
     }
     audio_ft8_tx_monitor_stop();
-    ESP_LOGI(TAG, "DONE: FT8 output disabled");
+    ESP_LOGI(TAG, "DONE: digital output disabled");
     portENTER_CRITICAL(&s_swap_mux);
     s_swap_pending = false;
     portEXIT_CRITICAL(&s_swap_mux);
@@ -565,6 +576,7 @@ esp_err_t si5351_tone_test_start_parity(int parity)
     if (parity < -1 || parity > 1) return ESP_ERR_INVALID_ARG;
     if (s_tone_running || !s_dev) return ESP_ERR_INVALID_STATE;
     s_swap_pending = false;
+    s_tx_ft4 = false;
     s_manual_takeover = false;
     s_requested_tx_parity = parity;
     s_force_immediate_tx = false;
@@ -629,4 +641,31 @@ esp_err_t si5351_apply_calibration(int32_t ppm_x10)
         (void)si5351_test_10mhz();
     }
     return err;
+}
+
+/* FT4 TX: same RF/relay worker, different 7.5-second framing and 4-GFSK tones.
+ * No automatic QSO integration in this stage. */
+esp_err_t si5351_ft4_set_message(const char *to, const char *from, const char *extra)
+{
+    return si5351_ft8_set_message(to, from, extra);
+}
+
+esp_err_t si5351_ft4_start_parity(int parity)
+{
+    if (parity < -1 || parity > 1) return ESP_ERR_INVALID_ARG;
+    if (s_tone_running || !s_dev) return ESP_ERR_INVALID_STATE;
+    s_swap_pending = false;
+    s_manual_takeover = false;
+    s_requested_tx_parity = parity;
+    s_force_immediate_tx = false;
+    s_tone_stop = false;
+    s_tone_index = -1;
+    s_tx_ft4 = true;
+    s_tone_running = true;
+    if (xTaskCreate(tone_task, "si5351_ft4", 4096, NULL, 4, NULL) != pdPASS) {
+        s_tone_running = false;
+        s_tone_index = -1;
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
 }

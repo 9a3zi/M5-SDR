@@ -38,6 +38,7 @@
 #include "audio.h"
 #include "rs41.h"
 #include "ft8.h"
+#include "ft4.h"
 #include "wspr.h"
 #include "horus.h"
 #include "horus_decoder.h"
@@ -633,7 +634,8 @@ static void demod_bb(void)
             /* … and shift back up, real part = audio. */
             float y = a * c - sgn * b * sn;
 
-            if (mode == DSP_MODE_FT8) ft8_feed(y); /* decoders get the audio before the AGC */
+            if (mode == DSP_MODE_FT8) ft8_feed(y);
+            else if (mode == DSP_MODE_FT4) ft4_feed(y); /* decoders get the audio before the AGC */
             else if (mode == DSP_MODE_WSPR) wspr_feed(y);
 
             /* feed-forward peak AGC */
@@ -732,10 +734,11 @@ static void apply_mode(int m)
     case DSP_MODE_USB:
     case DSP_MODE_LSB:
     case DSP_MODE_FT8:
+    case DSP_MODE_FT4:
     case DSP_MODE_WSPR: {
         float sg = (m == DSP_MODE_LSB) ? -1.0f : 1.0f; /* FT8 and WSPR are USB */
         if (DSP_SSB_SWAP) sg = -sg;
-        bool dig = (m == DSP_MODE_FT8 || m == DSP_MODE_WSPR); /* wide passband for the digital modes */
+        bool dig = (m == DSP_MODE_FT8 || m == DSP_MODE_FT4 || m == DSP_MODE_WSPR); /* wide passband for the digital modes */
         float pitch = dig ? FT8_PITCH_HZ : SSB_PITCH_HZ;
         float cut = dig ? FT8_CUT_HZ : SSB_CUT_HZ;
         s_bb_sgn = sg;
@@ -744,6 +747,7 @@ static void apply_mode(int m)
         design_fir_lp(cut, BB_RATE);
         s_agc_dec = SSB_AGC_DECAY;
         if (m == DSP_MODE_FT8) ft8_reset();
+        if (m == DSP_MODE_FT4) { ft4_start(); ft4_reset(); }
         if (m == DSP_MODE_WSPR) wspr_reset();
         break;
     }
@@ -840,6 +844,6 @@ int dsp_get_mode(void) { return s_mode_pub; }
 
 const char *dsp_mode_name(int mode)
 {
-    static const char *const N[DSP_MODE_COUNT] = {"WFM", "NFM", "AM", "USB", "LSB", "CW", "RS41", "FT8", "WSPR", "HORUS", "APRS"};
+    static const char *const N[DSP_MODE_COUNT] = {"WFM", "NFM", "AM", "USB", "LSB", "CW", "RS41", "FT8", "WSPR", "HORUS", "APRS", "FT4"};
     return (mode >= 0 && mode < DSP_MODE_COUNT) ? N[mode] : "?";
 }

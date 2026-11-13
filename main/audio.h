@@ -6,6 +6,7 @@
  */
 #pragma once
 #include <stdint.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -31,6 +32,7 @@ void audio_set_volume(int vol);
 void audio_touch_beep(void);
 
 /* TX monitor: mute RTL-SDR audio while TX is active; tone = 1500 + symbol*6.25 Hz. */
+void audio_ft8_tx_monitor_set_ft4(bool ft4);
 void audio_ft8_tx_monitor_start(void);
 void audio_ft8_tx_monitor_symbol(uint8_t symbol);
 void audio_ft8_tx_monitor_stop(void);

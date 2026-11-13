@@ -31,6 +31,7 @@ static volatile uint32_t s_beep_request;
 /* 0 = RX, 1 = TX monitor. Atomic access from Si5351 and audio tasks. */
 static volatile uint32_t s_ft8_tx_active;
 static volatile uint32_t s_ft8_tx_symbol;
+static volatile uint32_t s_ft8_tx_is_ft4;
 static volatile uint32_t s_ft8_tx_volume = 25u;
 
 void audio_ft8_tx_monitor_set_volume(int percent)
@@ -43,6 +44,11 @@ void audio_ft8_tx_monitor_set_volume(int percent)
 int audio_ft8_tx_monitor_get_volume(void)
 {
     return (int)__atomic_load_n(&s_ft8_tx_volume, __ATOMIC_RELAXED);
+}
+
+void audio_ft8_tx_monitor_set_ft4(bool ft4)
+{
+    __atomic_store_n(&s_ft8_tx_is_ft4, ft4 ? 1u : 0u, __ATOMIC_RELAXED);
 }
 
 void audio_ft8_tx_monitor_start(void)
@@ -97,7 +103,8 @@ static void audio_out_task(void *arg)
             const size_t frames = 480;
             const uint32_t symbol = __atomic_load_n(&s_ft8_tx_symbol, __ATOMIC_RELAXED);
             /* Frequency: 1500 + symbol * 6.25 Hz. Phase accumulator, no libm. */
-            const uint64_t hz_x100 = 150000ULL + (uint64_t)symbol * 625ULL;
+            const bool ft4 = __atomic_load_n(&s_ft8_tx_is_ft4, __ATOMIC_RELAXED) != 0;
+            const uint64_t hz_x100 = 150000ULL + (uint64_t)symbol * (ft4 ? 2083ULL : 625ULL);
             const uint32_t step = (uint32_t)((hz_x100 * (1ULL << 32)) /
                                               ((uint64_t)AUDIO_SAMPLE_RATE * 100ULL));
             for (size_t i = 0; i < frames; ++i) {

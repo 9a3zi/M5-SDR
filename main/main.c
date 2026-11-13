@@ -21,6 +21,7 @@
 #include "sdr.h"
 #include "dsp.h"
 #include "ft8.h"
+#include "ft4.h"
 #include "wspr.h"
 #include "audio.h"
 #include "ui.h"
@@ -134,6 +135,7 @@ esp_log_level_set("SI5351", ESP_LOG_INFO);
     /* Speaker up, then demod + landscape UI take over the screen. */
     audio_init();
     dsp_start();
+    /* FT4 decoder starts lazily when FT4 mode is selected, to preserve USB heap. */
     ft8_start(); /* FT8 decoder task (idle until FT8 mode feeds it audio) */
     wspr_start(); /* WSPR decoder task (likewise) */
     lora_aprs_init();
