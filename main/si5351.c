@@ -186,7 +186,7 @@ static uint64_t s_ft8_base_chz = FT8_BASE_CHZ;
 esp_err_t si5351_ft8_set_base_cHz(uint64_t base_chz)
 {
     if (s_tone_running) return ESP_ERR_INVALID_STATE;
-    if (base_chz < 350000000ULL || base_chz > 3000000000ULL)
+    if (base_chz < 180000000ULL || base_chz > 3000000000ULL)
         return ESP_ERR_INVALID_ARG;
     s_ft8_base_chz = base_chz;
     return ESP_OK;
@@ -244,7 +244,7 @@ static esp_err_t write_one(uint8_t reg, uint8_t val)
  * No PLL reset between symbols. */
 esp_err_t si5351_set_frequency_cHz(uint64_t freq_cHz)
 {
-    if (freq_cHz < 350000000ULL || freq_cHz > 3000000000ULL)
+    if (freq_cHz < 180000000ULL || freq_cHz > 3000000000ULL)
         return ESP_ERR_INVALID_ARG;
     if (!s_dev) return ESP_ERR_INVALID_STATE;
 

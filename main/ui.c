@@ -1250,6 +1250,21 @@ static int ft8_visible_messages(ft8_msg_t *out, int capacity, ft8_status_t *st)
         if (s_ft8_cq_only && !ft8_is_cq_message(all[i].text)) continue;
         if (count < capacity) out[count++] = all[i];
     }
+    /* CQ ONLY: sort by SNR ascending internally, because both the FT8
+     * panel and touch selection read this array in reverse order.
+     * Strongest CQ therefore appears first. Equal SNR keeps decode order.
+     * ALL mode retains its original order. */
+    if (s_ft8_cq_only) {
+        for (int i = 1; i < count; ++i) {
+            ft8_msg_t item = out[i];
+            int j = i;
+            while (j > 0 && out[j - 1].snr > item.snr) {
+                out[j] = out[j - 1];
+                --j;
+            }
+            out[j] = item;
+        }
+    }
     if (st->total != s_ft8_visible_period_last_total ||
         latest_utc != s_ft8_visible_period_last_utc ||
         latest_slot != s_ft8_visible_period_last_slot ||
